@@ -1,0 +1,80 @@
+[package]
+name = "bitmako"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Ultra-high-throughput chemoinformatics ETL and BMW similarity search engine"
+license = "MIT"
+
+[[bin]]
+name = "bitmako"
+path = "src/main.rs"
+
+[[bench]]
+name = "etl_bench"
+harness = false
+
+[[bench]]
+name = "search_bench"
+harness = false
+
+[dependencies]
+# Compression
+bzip2 = "0.4"
+
+# Parallelism
+rayon = "1.10"
+
+# Apache Arrow columnar format
+arrow-array = "53"
+arrow-schema = "53"
+arrow-ipc = "53"
+arrow-cast = "53"
+
+# Lance columnar dataset
+lance = "0.22"
+lance-core = "0.22"
+lance-table = "0.22"
+
+# Error handling
+thiserror = "2"
+
+# Async runtime (required by lance)
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Hashing for fingerprint generation
+crc32fast = "1"
+rustc-hash = "2"
+
+# Fast serialization for index files
+bytemuck = { version = "1", features = ["derive"] }
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Compact priority queue for top-k
+ordered-float = "4"
+
+# Memory mapping for index files
+memmap2 = "0.9"
+
+# Channel for streaming pipeline
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+debug = true

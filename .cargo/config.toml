@@ -1,0 +1,15 @@
+[build]
+# Enable native CPU optimizations: AVX2/AVX-512 POPCNT for Tanimoto inner loops,
+# and LLVM autovectorization for the 16-word fingerprint scan.
+# This is mandatory for production performance — do NOT remove for benchmarks.
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+# PGO and LTO are configured per-profile in Cargo.toml.
+# For profiling, override: CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
