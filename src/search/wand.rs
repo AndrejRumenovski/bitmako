@@ -22,9 +22,9 @@ use tracing::{debug};
 use crate::error::Result;
 use crate::etl::fingerprint::Fingerprint;
 use crate::index::IndexReader;
-use crate::index::posting_list::{PostingList, BLOCK_SIZE};
+use crate::index::posting_list::PostingList;
 use crate::search::query::{SimilarityQuery, validate_query};
-use crate::search::tanimoto::{tanimoto_upper_bound, tanimoto_with_threshold};
+use crate::search::tanimoto::tanimoto_with_threshold;
 
 /// Scored candidate in the top-k min-heap.
 /// BinaryHeap is a max-heap; we reverse comparison to make it a min-heap
@@ -72,21 +72,6 @@ impl<'a> ListCursor<'a> {
     #[inline]
     fn advance_to(&mut self, target: u32) {
         self.pos = self.pl.advance_to(self.pos, target);
-    }
-
-    /// Max compound popcount in the current block (for block-level Tanimoto UB)
-    #[inline]
-    fn block_max_pop(&self) -> u8 {
-        let block = self.pos / BLOCK_SIZE;
-        self.pl.block_max(block)
-    }
-
-    /// Advance past the current block entirely
-    #[inline]
-    fn skip_block(&mut self) {
-        let block = self.pos / BLOCK_SIZE;
-        let next_block_start = (block + 1) * BLOCK_SIZE;
-        self.pos = self.pl.advance_to(self.pos, next_block_start as u32);
     }
 }
 
@@ -142,90 +127,92 @@ impl<'a> BmwEngine<'a> {
 
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(query.top_k + 1);
         let mut threshold = query.threshold;
+        let p = query.query_pop;
         let mut docs_evaluated: u64 = 0;
-        let mut blocks_skipped: u64 = 0;
-        let mut docs_skipped_by_popcount: u64 = 0;
+        let mut pivots_skipped: u64 = 0;
+
+        // Minimum number of query bits a candidate must share to possibly reach
+        // `t`. A doc sharing `c` query bits has popcount K ≥ c, so its Tanimoto is
+        // c/(P+K−c) ≤ c/P; reaching `t` therefore requires c ≥ t·P. This is the
+        // WAND pivot threshold — only docs appearing in ≥ θ posting lists can win.
+        let min_shared = |t: f32| -> usize {
+            if t <= 0.0 {
+                1
+            } else {
+                ((t * p as f32).ceil() as usize).clamp(1, p as usize)
+            }
+        };
 
         loop {
-            // --- Step 1: Remove exhausted cursors ---
             cursors.retain(|c| !c.is_exhausted());
-            if cursors.is_empty() {
-                break;
+            let theta = min_shared(threshold);
+            if theta > cursors.len() {
+                break; // not enough remaining lists to ever reach θ shared bits
             }
 
-            // --- Step 2: Find minimum current doc_id (next candidate) ---
-            let current_doc = cursors
-                .iter()
-                .filter_map(|c| c.current_doc())
-                .min()
-                .unwrap(); // safe: all cursors are non-exhausted
+            // Sort live cursors by current doc; the θ-th smallest is the pivot.
+            cursors.sort_unstable_by_key(|c| c.current_doc().unwrap());
+            let pivot_doc = cursors[theta - 1].current_doc().unwrap();
 
-            // --- Step 3: Block-Max Upper Bound (BMW pruning) ---
-            // For the cursor(s) at current_doc, check if ANY doc in their block
-            // can possibly have Tanimoto >= threshold.
-            let block_max_ub = self.compute_block_max_ub(query, &cursors, current_doc);
+            if cursors[0].current_doc().unwrap() == pivot_doc {
+                // Fully aligned: every cursor at `pivot_doc` is a shared query bit,
+                // so the count gives the exact intersection size c.
+                let c = cursors
+                    .iter()
+                    .filter(|cur| cur.current_doc() == Some(pivot_doc))
+                    .count() as u32;
+                let k = self.index.compound_pop(pivot_doc) as u32;
 
-            if block_max_ub < threshold {
-                // No document in this block can meet the threshold.
-                // Advance all cursors that are in this block past it.
-                blocks_skipped += 1;
-                for cursor in cursors.iter_mut() {
-                    if cursor.current_doc().map(|d| d <= current_doc).unwrap_or(false) {
-                        cursor.skip_block();
-                    }
-                }
-                continue;
-            }
+                // Exact Tanimoto upper bound from the known intersection size.
+                let denom = p + k - c;
+                let ub = if denom == 0 { 0.0 } else { c as f32 / denom as f32 };
 
-            // --- Step 4: Popcount upper bound (fast pre-filter) ---
-            let candidate_pop = self.index.compound_pop(current_doc) as u32;
-
-            let pop_ub = tanimoto_upper_bound(query.query_pop, candidate_pop);
-
-            if pop_ub < threshold {
-                // Popcount ratio cannot meet threshold — skip this doc
-                docs_skipped_by_popcount += 1;
-                for cursor in cursors.iter_mut() {
-                    if cursor.current_doc() == Some(current_doc) {
-                        cursor.advance_to(current_doc + 1);
-                    }
-                }
-                continue;
-            }
-
-            // --- Step 5: Exact Tanimoto evaluation ---
-            if let Some(fp) = get_fingerprint(current_doc) {
-                let (score, meets) = tanimoto_with_threshold(&query.query_fp, &fp, threshold);
-                docs_evaluated += 1;
-
-                if meets {
-                    heap.push(Candidate {
-                        score: ordered_float::OrderedFloat(score),
-                        doc_id: current_doc,
-                    });
-                    if heap.len() > query.top_k {
-                        heap.pop(); // evict lowest score
-                    }
-                    // Raise threshold to current worst kept score
-                    if heap.len() == query.top_k {
-                        if let Some(worst) = heap.peek() {
-                            threshold = threshold.max(worst.score.0);
+                if ub >= threshold {
+                    if let Some(fp) = get_fingerprint(pivot_doc) {
+                        let (score, meets) =
+                            tanimoto_with_threshold(&query.query_fp, &fp, threshold);
+                        docs_evaluated += 1;
+                        if meets {
+                            heap.push(Candidate {
+                                score: ordered_float::OrderedFloat(score),
+                                doc_id: pivot_doc,
+                            });
+                            if heap.len() > query.top_k {
+                                heap.pop();
+                            }
+                            if heap.len() == query.top_k {
+                                if let Some(worst) = heap.peek() {
+                                    threshold = threshold.max(worst.score.0);
+                                }
+                            }
                         }
                     }
+                } else {
+                    pivots_skipped += 1;
                 }
-            }
 
-            // Advance all cursors that are at current_doc
-            for cursor in cursors.iter_mut() {
-                if cursor.current_doc() == Some(current_doc) {
-                    cursor.advance_to(current_doc + 1);
+                // Advance every cursor sitting on the pivot past it.
+                for cursor in cursors.iter_mut() {
+                    if cursor.current_doc() == Some(pivot_doc) {
+                        cursor.advance_to(pivot_doc + 1);
+                    }
+                }
+            } else {
+                // Not aligned: skip a trailing cursor forward to the pivot. Docs
+                // below the pivot appear in < θ lists, so none can qualify.
+                pivots_skipped += 1;
+                for cursor in cursors.iter_mut() {
+                    if cursor.current_doc().map(|d| d < pivot_doc).unwrap_or(false) {
+                        cursor.advance_to(pivot_doc);
+                        break;
+                    }
                 }
             }
         }
 
         debug!(
-            "BMW stats: evaluated={} block_skipped={} pop_skipped={} results={}",
-            docs_evaluated, blocks_skipped, docs_skipped_by_popcount, heap.len()
+            "WAND stats: evaluated={} pivots_skipped={} results={}",
+            docs_evaluated, pivots_skipped, heap.len()
         );
 
         // `into_sorted_vec` on our min-heap (reversed Ord) yields elements in
@@ -237,36 +224,6 @@ impl<'a> BmwEngine<'a> {
             .collect();
 
         Ok(results)
-    }
-
-    /// Compute the block-level upper bound on Tanimoto.
-    ///
-    /// With only `max_block_pop` (highest compound popcount in the block):
-    ///   - If query_pop ≤ max_block_pop: a doc with exactly query_pop bits might exist → UB = 1.0
-    ///   - If query_pop > max_block_pop: all docs have fewer bits than the query → UB = max_pop / query_pop
-    ///
-    /// This is the tightest safe bound obtainable from max_block_pop alone.
-    fn compute_block_max_ub(
-        &self,
-        query: &SimilarityQuery,
-        cursors: &[ListCursor<'_>],
-        current_doc: u32,
-    ) -> f32 {
-        let max_pop = cursors
-            .iter()
-            .filter(|c| c.current_doc().map(|d| d <= current_doc).unwrap_or(false))
-            .map(|c| c.block_max_pop() as u32)
-            .max()
-            .unwrap_or(0);
-
-        if max_pop == 0 || query.query_pop == 0 {
-            return 0.0;
-        }
-        if query.query_pop <= max_pop {
-            1.0
-        } else {
-            max_pop as f32 / query.query_pop as f32
-        }
     }
 }
 
@@ -348,6 +305,104 @@ mod tests {
                 "Results not sorted descending: {} < {}",
                 window[0].1, window[1].1
             );
+        }
+    }
+
+    /// Exhaustive Tanimoto scan: ground truth for the WAND pivot algorithm.
+    ///
+    /// Requires score > 0: a doc sharing zero query bits appears in none of the
+    /// query's posting lists, so no inverted-index search can enumerate it. This
+    /// matches WAND semantics — only docs with positive overlap are candidates.
+    fn brute_force(
+        query_fp: &Fingerprint,
+        fps: &[Fingerprint],
+        threshold: f32,
+    ) -> Vec<(u32, f32)> {
+        use crate::search::tanimoto::tanimoto;
+        let mut out: Vec<(u32, f32)> = fps
+            .iter()
+            .enumerate()
+            .map(|(i, fp)| (i as u32, tanimoto(query_fp, fp)))
+            .filter(|(_, s)| *s >= threshold && *s > 0.0)
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        out
+    }
+
+    #[test]
+    fn test_wand_matches_brute_force() {
+        // A chemically diverse set so query bits range from rare to common.
+        let smiles = [
+            "CCO", "CCCO", "CCCCO", "CCCCCO", "c1ccccc1", "Cc1ccccc1",
+            "CN", "CC(=O)O", "CNC(=O)c1ccccc1", "c1ccncc1", "OCC(O)CO",
+            "CC(C)Cc1ccc(cc1)C(C)C(=O)O", "CC(=O)Oc1ccccc1C(=O)O",
+            "C1CCCCC1", "c1ccc2ccccc2c1", "NCCO", "CCN(CC)CC",
+        ];
+        let (fps, index, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index);
+
+        // Query with each compound, at several thresholds, and compare the
+        // set of (doc_id, score) above threshold against the exhaustive scan.
+        for q in &["CCO", "c1ccccc1", "CC(=O)Oc1ccccc1C(=O)O", "NCCO", "CCN(CC)CC"] {
+            let query_fp = compute_morgan_fp(q);
+            for &t in &[0.0f32, 0.2, 0.5, 0.75, 0.9] {
+                let expected = brute_force(&query_fp, &fps, t);
+                let query = SimilarityQuery::new(query_fp, t, fps.len());
+                let got = engine
+                    .search(&query, |doc_id| fps.get(doc_id as usize).copied())
+                    .unwrap();
+
+                assert_eq!(
+                    got.len(),
+                    expected.len(),
+                    "count mismatch for query {} @ t={}: wand={} brute={}",
+                    q, t, got.len(), expected.len()
+                );
+
+                // Compare as doc_id → score maps (ordering of ties may differ).
+                let mut got_sorted = got.clone();
+                got_sorted.sort_by_key(|(d, _)| *d);
+                let mut exp_sorted = expected.clone();
+                exp_sorted.sort_by_key(|(d, _)| *d);
+                for ((gd, gs), (ed, es)) in got_sorted.iter().zip(exp_sorted.iter()) {
+                    assert_eq!(gd, ed, "doc_id mismatch for query {} @ t={}", q, t);
+                    assert!(
+                        (gs - es).abs() < 1e-6,
+                        "score mismatch for doc {} query {} @ t={}: {} vs {}",
+                        gd, q, t, gs, es
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_wand_topk_truncation() {
+        let smiles = [
+            "CCO", "CCCO", "CCCCO", "CCCCCO", "CCCCCCO", "CCCCCCCO", "OCCO",
+        ];
+        let (fps, index, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index);
+        let query_fp = compute_morgan_fp("CCCO");
+
+        // top_k smaller than the number of qualifying hits must return exactly
+        // the top_k highest scores from the exhaustive ranking.
+        let expected = brute_force(&query_fp, &fps, 0.0);
+        for &k in &[1usize, 2, 3] {
+            let query = SimilarityQuery::new(query_fp, 0.0, k);
+            let got = engine
+                .search(&query, |doc_id| fps.get(doc_id as usize).copied())
+                .unwrap();
+            assert_eq!(got.len(), k);
+            // The k-th best score from WAND must equal the k-th best brute score.
+            let got_scores: Vec<f32> = got.iter().map(|(_, s)| *s).collect();
+            for (i, gs) in got_scores.iter().enumerate() {
+                assert!(
+                    (gs - expected[i].1).abs() < 1e-6,
+                    "rank {} score mismatch k={}: {} vs {}",
+                    i, k, gs, expected[i].1
+                );
+            }
         }
     }
 }
