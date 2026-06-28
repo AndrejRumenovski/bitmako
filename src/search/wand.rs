@@ -120,17 +120,20 @@ impl<'a> BmwEngine<'a> {
             return Ok(Vec::new());
         }
 
-        // Open one cursor per active bit posting list (skip empty lists)
-        let mut cursors: Vec<ListCursor<'_>> = active_bits
+        // Decode only the posting lists for the query's active bits. At corpus
+        // scale this is the difference between a few GB and ~190 GB of RAM.
+        let decoded: Vec<(usize, PostingList)> = active_bits
             .iter()
-            .filter_map(|&bit| {
-                let pl = &self.index.posting_lists[bit];
-                if pl.is_empty() {
-                    None
-                } else {
-                    Some(ListCursor { bit, pl, pos: 0 })
-                }
-            })
+            .map(|&bit| Ok::<_, crate::error::BitMakoError>((bit, self.index.decode_posting_list(bit)?)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, pl)| !pl.is_empty())
+            .collect();
+
+        // Open one cursor per non-empty active-bit posting list.
+        let mut cursors: Vec<ListCursor<'_>> = decoded
+            .iter()
+            .map(|(bit, pl)| ListCursor { bit: *bit, pl, pos: 0 })
             .collect();
 
         if cursors.is_empty() {
@@ -175,12 +178,7 @@ impl<'a> BmwEngine<'a> {
             }
 
             // --- Step 4: Popcount upper bound (fast pre-filter) ---
-            let candidate_pop = self
-                .index
-                .compound_pops
-                .get(current_doc as usize)
-                .copied()
-                .unwrap_or(0) as u32;
+            let candidate_pop = self.index.compound_pop(current_doc) as u32;
 
             let pop_ub = tanimoto_upper_bound(query.query_pop, candidate_pop);
 

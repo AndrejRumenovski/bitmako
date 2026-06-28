@@ -1,4 +1,6 @@
 /target
+/data
 *.lance
 *.bitmako
+*.fp
 *.bz2

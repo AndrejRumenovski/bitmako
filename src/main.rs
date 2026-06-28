@@ -1,10 +1,11 @@
 //! BitMako CLI entry point.
 //!
 //! Usage:
-//!   bitmako ingest       --input <file.bz2> --output <dataset.lance>
-//!   bitmako build-index  --lance <dataset.lance> --output <index.bitmako>
-//!   bitmako search       --index <index.bitmako> --query <SMILES> --threshold 0.7 --top-k 100
-//!   bitmako search       --index <index.bitmako> --query <SMILES> --mw-max 500 --logp-max 5
+//!   bitmako ingest         --input <file.bz2> --output <dataset.lance>
+//!   bitmako build-index    --lance <dataset.lance> --output <index.bitmako>
+//!   bitmako build-fp-store --lance <dataset.lance> --output <store.fp>
+//!   bitmako search         --index <index.bitmako> --fp-store <store.fp> --query <SMILES> --threshold 0.7 --top-k 100
+//!   bitmako search         --index <index.bitmako> --fp-store <store.fp> --query <SMILES> --mw-max 500 --logp-max 5
 
 use std::path::PathBuf;
 use std::process;
@@ -14,7 +15,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use bitmako::error::Result;
 use bitmako::etl::{PipelineConfig, run_pipeline};
-use bitmako::etl::fingerprint::{compute_morgan_fp, Fingerprint};
+use bitmako::etl::fingerprint::compute_morgan_fp;
 use bitmako::etl::reader::ReaderConfig;
 use bitmako::index::IndexReader;
 use bitmako::search::query::{PropertyField, PropertyFilter, SimilarityQuery};
@@ -44,9 +45,11 @@ fn main() {
     let result = match args[1].as_str() {
         "ingest" => cmd_ingest(&args[2..]),
         "build-index" => cmd_build_index(&args[2..]),
+        "build-fp-store" => cmd_build_fp_store(&args[2..]),
         "search" => cmd_search(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
+            eprintln!("Usage: bitmako <ingest|build-index|build-fp-store|search> [options]");
             process::exit(1);
         }
     };
@@ -289,10 +292,96 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `search --index <index.bitmako> --query <SMILES> --threshold 0.7 --top-k 50`
+/// `build-fp-store --lance <dataset.lance> --output <store.fp>`
+///
+/// Writes every fingerprint to a flat binary file in Lance scan order, so the
+/// resulting file can be memory-mapped and indexed directly by doc_id. Each
+/// fingerprint is 16 little-endian u64 words (128 bytes). At 1.4B compounds the
+/// output is ~174 GB — the scan order matches `build-index`, so doc_ids line up.
+fn cmd_build_fp_store(args: &[String]) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    use std::fs::File;
+    use arrow_array::{Array, cast::AsArray};
+    use arrow_array::types::UInt64Type;
+    use bitmako::etl::fingerprint::FP_WORDS;
+
+    let lance_path_str = require_flag(args, "--lance");
+    let output = PathBuf::from(require_flag(args, "--output"));
+
+    info!("Building flat fingerprint store: {} → {:?}", lance_path_str, output);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(bitmako::error::BitMakoError::Io)?;
+
+    let file = File::create(&output)?;
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
+    let mut count: u64 = 0;
+
+    rt.block_on(async {
+        use lance::dataset::Dataset;
+        use futures::TryStreamExt;
+
+        let dataset = Dataset::open(&lance_path_str)
+            .await
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+        let mut stream = dataset
+            .scan()
+            .project(&["fingerprint"])
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .try_into_stream()
+            .await
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+        {
+            let fp_col = batch
+                .column_by_name("fingerprint")
+                .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("missing fingerprint".into()))?;
+            let list_arr = fp_col
+                .as_any()
+                .downcast_ref::<arrow_array::FixedSizeListArray>()
+                .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("not FixedSizeListArray".into()))?;
+
+            for row in 0..list_arr.len() {
+                let values = list_arr.value(row);
+                let u64_arr = values.as_primitive::<UInt64Type>();
+                let words = u64_arr.values();
+
+                let mut buf = [0u8; FP_WORDS * 8];
+                for i in 0..FP_WORDS {
+                    let w = words.get(i).copied().unwrap_or(0);
+                    buf[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+                }
+                writer.write_all(&buf).map_err(bitmako::error::BitMakoError::Io)?;
+                count += 1;
+
+                if count % 100_000_000 == 0 {
+                    info!("Wrote {} million fingerprints", count / 1_000_000);
+                }
+            }
+        }
+        Ok::<(), bitmako::error::BitMakoError>(())
+    })?;
+
+    writer.flush().map_err(bitmako::error::BitMakoError::Io)?;
+    info!(
+        "Fingerprint store written: {} fingerprints ({} MB)",
+        count,
+        count * (FP_WORDS as u64 * 8) / (1024 * 1024)
+    );
+    Ok(())
+}
+
+/// `search --index <index.bitmako> --fp-store <store.fp> --query <SMILES> --threshold 0.7 --top-k 50`
 /// Optional: `--mw-max 500 --logp-max 5`
 fn cmd_search(args: &[String]) -> Result<()> {
     let index_path = PathBuf::from(require_flag(args, "--index"));
+    let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
     let query_smiles = require_flag(args, "--query");
     let threshold: f32 = flag_value(args, "--threshold")
         .and_then(|s| s.parse().ok())
@@ -325,9 +414,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
         });
     }
 
-    // NOTE: For a full integration, supply the fingerprint store from a
-    // memory-mapped flat file written alongside the Lance dataset.
-    let fp_store: Vec<Fingerprint> = Vec::new();
+    let fp_store = bitmako::search::fp_store::FpStore::open(&fp_store_path)?;
     let searcher = Searcher::open_from_index(index, fp_store);
     let results = searcher.search(&query)?;
 
