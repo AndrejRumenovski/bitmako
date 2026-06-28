@@ -3,6 +3,7 @@
 pub mod block_max;
 pub mod builder;
 pub mod posting_list;
+pub mod skip;
 
 use std::path::Path;
 
@@ -107,12 +108,20 @@ impl IndexReader {
     /// Only the bytes for this one list are read from the mmap and decoded,
     /// so callers should decode just the active bits of their query.
     pub fn decode_posting_list(&self, bit: usize) -> Result<PostingList> {
+        PostingList::deserialize(self.posting_bytes(bit)).map_err(BitMakoError::Io)
+    }
+
+    /// Raw serialized bytes of the posting list for `bit` (the `u32 num_blocks`
+    /// header followed by block data). Used by the streaming cursor and the skip
+    /// index builder, which decode block-by-block rather than all at once.
+    #[inline]
+    pub fn posting_bytes(&self, bit: usize) -> &[u8] {
         let start = self.postings_start + self.offsets[bit] as usize;
         let end = if bit + 1 < self.offsets.len() {
             self.postings_start + self.offsets[bit + 1] as usize
         } else {
             self.mmap.len()
         };
-        PostingList::deserialize(&self.mmap[start..end]).map_err(BitMakoError::Io)
+        &self.mmap[start..end]
     }
 }

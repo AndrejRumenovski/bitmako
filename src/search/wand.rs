@@ -22,7 +22,8 @@ use tracing::{debug};
 use crate::error::Result;
 use crate::etl::fingerprint::Fingerprint;
 use crate::index::IndexReader;
-use crate::index::posting_list::PostingList;
+use crate::index::posting_list::decode_block;
+use crate::index::skip::{SkipIndex, SkipSlice};
 use crate::search::query::{SimilarityQuery, validate_query};
 use crate::search::tanimoto::tanimoto_with_threshold;
 
@@ -49,40 +50,117 @@ impl Ord for Candidate {
     }
 }
 
-/// Iterator state over one posting list during search execution
-struct ListCursor<'a> {
-    #[allow(dead_code)]
-    bit: usize,
-    pl: &'a PostingList,
-    pos: usize,
+/// Streaming cursor over one posting list, decoding a single 128-doc block at a
+/// time straight from the memory-mapped index bytes.
+///
+/// `advance_to` uses the skip index to binary-search the block that may contain
+/// the target and decodes only that block — so jumping forward over a list with
+/// hundreds of millions of postings costs O(log blocks + one block) rather than
+/// decoding the whole list. Resident memory per cursor is one block (≤128 u32).
+struct StreamCursor<'a> {
+    list: &'a [u8],
+    skip: SkipSlice<'a>,
+    /// Currently decoded block.
+    buf: Vec<u32>,
+    /// Position of the live doc within `buf`.
+    buf_idx: usize,
+    /// Index of the block currently in `buf`.
+    cur_block: usize,
+    exhausted: bool,
 }
 
-impl<'a> ListCursor<'a> {
+impl<'a> StreamCursor<'a> {
+    fn new(list: &'a [u8], skip: SkipSlice<'a>) -> Self {
+        let mut c = StreamCursor {
+            list,
+            skip,
+            buf: Vec::with_capacity(128),
+            buf_idx: 0,
+            cur_block: 0,
+            exhausted: true,
+        };
+        if c.skip.num_blocks() > 0 {
+            c.load_block(0);
+        }
+        c
+    }
+
+    /// Decode block `b` into `buf`, positioning at its first doc.
+    #[inline]
+    fn load_block(&mut self, b: usize) {
+        if b >= self.skip.num_blocks() {
+            self.exhausted = true;
+            return;
+        }
+        let off = self.skip.byte_offset(b);
+        let base = self.skip.base(b);
+        decode_block(self.list, off, base, &mut self.buf);
+        self.buf_idx = 0;
+        self.cur_block = b;
+        self.exhausted = self.buf.is_empty();
+    }
+
     #[inline]
     fn current_doc(&self) -> Option<u32> {
-        self.pl.doc_ids.get(self.pos).copied()
+        if self.exhausted {
+            None
+        } else {
+            Some(self.buf[self.buf_idx])
+        }
     }
 
     #[inline]
     fn is_exhausted(&self) -> bool {
-        self.pos >= self.pl.len()
+        self.exhausted
     }
 
-    /// Advance to first position with doc_id >= target
-    #[inline]
+    /// Advance to the first doc_id >= target (forward-only).
     fn advance_to(&mut self, target: u32) {
-        self.pos = self.pl.advance_to(self.pos, target);
+        if self.exhausted {
+            return;
+        }
+        // Already at/after target.
+        if self.buf[self.buf_idx] >= target {
+            return;
+        }
+        // Target within the current block.
+        if target <= *self.buf.last().unwrap() {
+            while self.buf[self.buf_idx] < target {
+                self.buf_idx += 1;
+            }
+            return;
+        }
+        // Jump to the block that should contain target, never moving backwards.
+        let mut b = self.skip.block_for(target).max(self.cur_block + 1);
+        loop {
+            if b >= self.skip.num_blocks() {
+                self.exhausted = true;
+                return;
+            }
+            self.load_block(b);
+            if self.exhausted {
+                return;
+            }
+            if *self.buf.last().unwrap() >= target {
+                while self.buf[self.buf_idx] < target {
+                    self.buf_idx += 1;
+                }
+                return;
+            }
+            b += 1;
+        }
     }
 }
 
 /// Block-Max WAND execution engine
 pub struct BmwEngine<'a> {
     index: &'a IndexReader,
+    skip: &'a SkipIndex,
 }
 
 impl<'a> BmwEngine<'a> {
-    pub fn new(index: &'a IndexReader) -> Self {
-        BmwEngine { index }
+    pub fn new(index: &'a IndexReader, skip: &'a SkipIndex) -> Self {
+        BmwEngine { index, skip }
     }
 
     /// Execute a BMW top-k Tanimoto similarity search.
@@ -105,20 +183,23 @@ impl<'a> BmwEngine<'a> {
             return Ok(Vec::new());
         }
 
-        // Decode only the posting lists for the query's active bits. At corpus
-        // scale this is the difference between a few GB and ~190 GB of RAM.
-        let decoded: Vec<(usize, PostingList)> = active_bits
+        // Open a streaming cursor over each active-bit posting list. Each decodes
+        // one block at a time from the mmap'd index, so peak memory is bounded by
+        // the query (≤128 doc_ids per active bit), not the corpus.
+        let mut cursors: Vec<StreamCursor<'_>> = active_bits
             .iter()
-            .map(|&bit| Ok::<_, crate::error::BitMakoError>((bit, self.index.decode_posting_list(bit)?)))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|(_, pl)| !pl.is_empty())
-            .collect();
-
-        // Open one cursor per non-empty active-bit posting list.
-        let mut cursors: Vec<ListCursor<'_>> = decoded
-            .iter()
-            .map(|(bit, pl)| ListCursor { bit: *bit, pl, pos: 0 })
+            .filter_map(|&bit| {
+                let sk = self.skip.entries(bit);
+                if sk.is_empty() {
+                    return None;
+                }
+                let cursor = StreamCursor::new(self.index.posting_bytes(bit), sk);
+                if cursor.is_exhausted() {
+                    None
+                } else {
+                    Some(cursor)
+                }
+            })
             .collect();
 
         if cursors.is_empty() {
@@ -232,11 +313,14 @@ mod tests {
     use super::*;
     use crate::etl::fingerprint::compute_morgan_fp;
     use crate::index::builder::IndexBuilder;
+    use crate::index::skip::SkipIndex;
     use crate::index::IndexReader;
     use crate::search::query::SimilarityQuery;
     use tempfile::NamedTempFile;
 
-    fn build_index_from_smiles(smiles_list: &[&str]) -> (Vec<Fingerprint>, IndexReader, NamedTempFile) {
+    fn build_index_from_smiles(
+        smiles_list: &[&str],
+    ) -> (Vec<Fingerprint>, IndexReader, SkipIndex, NamedTempFile) {
         let fps: Vec<Fingerprint> = smiles_list.iter().map(|s| compute_morgan_fp(s)).collect();
         let mut builder = IndexBuilder::new();
         for (i, fp) in fps.iter().enumerate() {
@@ -245,17 +329,18 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         builder.write_index(tmp.path()).unwrap();
         let index = IndexReader::open(tmp.path()).unwrap();
-        (fps, index, tmp)
+        let skip = SkipIndex::build_in_memory(&index).unwrap();
+        (fps, index, skip, tmp)
     }
 
     #[test]
     fn test_exact_match_found() {
         let smiles = ["CCO", "c1ccccc1", "CNC(=O)c1ccccc1"];
-        let (fps, index, _tmp) = build_index_from_smiles(&smiles);
+        let (fps, index, skip, _tmp) = build_index_from_smiles(&smiles);
 
         let query_fp = compute_morgan_fp("CCO");
         let query = SimilarityQuery::new(query_fp, 0.5, 5);
-        let engine = BmwEngine::new(&index);
+        let engine = BmwEngine::new(&index, &skip);
 
         let fps_c = fps.clone();
         let results = engine.search(&query, |doc_id| fps_c.get(doc_id as usize).copied()).unwrap();
@@ -270,8 +355,8 @@ mod tests {
     #[test]
     fn test_high_threshold_fewer_results() {
         let smiles = ["CCO", "CCCO", "CCCCO", "c1ccccc1", "CN", "CC(=O)O"];
-        let (fps, index, _tmp) = build_index_from_smiles(&smiles);
-        let engine = BmwEngine::new(&index);
+        let (fps, index, skip, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index, &skip);
         let query_fp = compute_morgan_fp("CCO");
 
         let results_low = engine.search(
@@ -291,8 +376,8 @@ mod tests {
     #[test]
     fn test_results_sorted_descending() {
         let smiles = ["CCO", "CCCO", "CCCCO", "c1ccccc1", "CN", "CC(=O)O"];
-        let (fps, index, _tmp) = build_index_from_smiles(&smiles);
-        let engine = BmwEngine::new(&index);
+        let (fps, index, skip, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index, &skip);
         let query_fp = compute_morgan_fp("CCO");
         let query = SimilarityQuery::new(query_fp, 0.0, 100);
 
@@ -338,8 +423,8 @@ mod tests {
             "CC(C)Cc1ccc(cc1)C(C)C(=O)O", "CC(=O)Oc1ccccc1C(=O)O",
             "C1CCCCC1", "c1ccc2ccccc2c1", "NCCO", "CCN(CC)CC",
         ];
-        let (fps, index, _tmp) = build_index_from_smiles(&smiles);
-        let engine = BmwEngine::new(&index);
+        let (fps, index, skip, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index, &skip);
 
         // Query with each compound, at several thresholds, and compare the
         // set of (doc_id, score) above threshold against the exhaustive scan.
@@ -381,8 +466,8 @@ mod tests {
         let smiles = [
             "CCO", "CCCO", "CCCCO", "CCCCCO", "CCCCCCO", "CCCCCCCO", "OCCO",
         ];
-        let (fps, index, _tmp) = build_index_from_smiles(&smiles);
-        let engine = BmwEngine::new(&index);
+        let (fps, index, skip, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index, &skip);
         let query_fp = compute_morgan_fp("CCCO");
 
         // top_k smaller than the number of qualifying hits must return exactly

@@ -3,9 +3,10 @@
 //! Usage:
 //!   bitmako ingest         --input <file.bz2> --output <dataset.lance>
 //!   bitmako build-index    --lance <dataset.lance> --output <index.bitmako>
+//!   bitmako build-skip     --index <index.bitmako> --output <index.skip>
 //!   bitmako build-fp-store --lance <dataset.lance> --output <store.fp>
-//!   bitmako search         --index <index.bitmako> --fp-store <store.fp> --query <SMILES> --threshold 0.7 --top-k 100
-//!   bitmako search         --index <index.bitmako> --fp-store <store.fp> --query <SMILES> --mw-max 500 --logp-max 5
+//!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> --threshold 0.7 --top-k 100
+//!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> --mw-max 500 --logp-max 5
 
 use std::path::PathBuf;
 use std::process;
@@ -45,11 +46,12 @@ fn main() {
     let result = match args[1].as_str() {
         "ingest" => cmd_ingest(&args[2..]),
         "build-index" => cmd_build_index(&args[2..]),
+        "build-skip" => cmd_build_skip(&args[2..]),
         "build-fp-store" => cmd_build_fp_store(&args[2..]),
         "search" => cmd_search(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: bitmako <ingest|build-index|build-fp-store|search> [options]");
+            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|search> [options]");
             process::exit(1);
         }
     };
@@ -292,6 +294,25 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `build-skip --index <index.bitmako> --output <index.skip>`
+///
+/// Builds the skip-pointer sidecar from an existing index in a single pass:
+/// for every block of every bit it records the decoder base and byte offset, so
+/// the streaming cursor can jump to the block containing a target doc_id without
+/// decoding the whole list. This avoids a full index rebuild.
+fn cmd_build_skip(args: &[String]) -> Result<()> {
+    use bitmako::index::skip::SkipIndex;
+
+    let index_path = PathBuf::from(require_flag(args, "--index"));
+    let output = PathBuf::from(require_flag(args, "--output"));
+
+    info!("Building skip index from {:?} → {:?}", index_path, output);
+    let index = IndexReader::open(&index_path)?;
+    SkipIndex::build_to_file(&index, &output)?;
+    info!("Skip index written: {:?}", output);
+    Ok(())
+}
+
 /// `build-fp-store --lance <dataset.lance> --output <store.fp>`
 ///
 /// Writes every fingerprint to a flat binary file in Lance scan order, so the
@@ -381,6 +402,7 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
 /// Optional: `--mw-max 500 --logp-max 5`
 fn cmd_search(args: &[String]) -> Result<()> {
     let index_path = PathBuf::from(require_flag(args, "--index"));
+    let skip_path = PathBuf::from(require_flag(args, "--skip"));
     let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
     let query_smiles = require_flag(args, "--query");
     let threshold: f32 = flag_value(args, "--threshold")
@@ -414,8 +436,9 @@ fn cmd_search(args: &[String]) -> Result<()> {
         });
     }
 
+    let skip = bitmako::index::skip::SkipIndex::open(&skip_path)?;
     let fp_store = bitmako::search::fp_store::FpStore::open(&fp_store_path)?;
-    let searcher = Searcher::open_from_index(index, fp_store);
+    let searcher = Searcher::open_from_index(index, skip, fp_store);
     let results = searcher.search(&query)?;
 
     println!("Found {} results above threshold {}", results.len(), threshold);

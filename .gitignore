@@ -2,5 +2,6 @@
 /data
 *.lance
 *.bitmako
+*.skip
 *.fp
 *.bz2

@@ -40,11 +40,12 @@ library — **1.36 billion compounds** — on a single workstation.
  Arrow RecordBatches ──▶ Lance dataset  (compounds.lance)
       │
       ├── build-index ─────▶ inverted index   (compounds.bitmako)
+      │        └── build-skip ──▶ skip index   (compounds.skip)
       └── build-fp-store ──▶ flat fingerprints (compounds.fp)
                                    │
  query SMILES ──▶ BMW engine ◀─────┘
-                     │  (decodes only the query's active-bit posting lists,
-                     │   block-max pruning, popcount upper bounds)
+                     │  (streams active-bit posting lists block-at-a-time,
+                     │   WAND min-shared-bits pivoting, skip-index jumps)
                      ▼
               top-k (doc_id, Tanimoto)
 ```
@@ -60,19 +61,31 @@ the molecular graph; atom environments are hashed with CRC32 over two iterations
 words with POPCNT. Compiled with `target-cpu=native` so LLVM autovectorizes the
 inner loop.
 
-### Block-Max WAND
+### WAND search with streaming posting lists
 
-Posting lists are delta + LEB128-varint encoded in 128-doc blocks, each carrying the
-max compound popcount in that block. Search:
+Posting lists are delta + LEB128-varint encoded in 128-doc blocks. Search runs
+document-at-a-time over the active-bit lists with two key properties:
 
-1. Decode posting lists **only for the query's active bits** (memory stays
-   proportional to the query, not the corpus).
-2. Walk candidates in `doc_id` order; use the block max-popcount to compute a
-   Tanimoto upper bound and **skip whole blocks** that can't beat the current
-   threshold.
-3. Apply a per-doc popcount upper bound before fetching the full fingerprint.
-4. Fetch the fingerprint from the mmap'd flat store, compute exact Tanimoto, and
-   update the top-k min-heap — raising the threshold as it fills.
+1. **Min-shared-bits pivoting.** A doc sharing `c` of the query's bits has
+   Tanimoto `c/(P+K−c) ≤ c/P`, so reaching threshold `t` requires `c ≥ ⌈t·P⌉`
+   shared bits. The engine jumps directly to docs appearing in `≥ θ` posting
+   lists (the WAND pivot), and reads the exact intersection size `c` for free
+   from how many cursors align at the pivot — a tight upper bound before any
+   fingerprint fetch. `θ` rises as the top-k heap fills, tightening pruning.
+2. **Streaming, skip-indexed cursors.** Each cursor decodes one 128-doc block at
+   a time straight from the mmap'd index. `advance_to` consults the **skip index**
+   (`compounds.skip`) to binary-search the block containing the target and
+   decodes only that block — so jumping over a list of hundreds of millions of
+   postings costs O(log blocks + one block), and resident memory per query is a
+   few blocks rather than the whole lists. This is what keeps common-fragment
+   queries from OOM-ing (the naive "decode every active list" approach needs
+   tens of GB and can exceed RAM).
+
+Surviving pivots fetch the fingerprint from the mmap'd flat store, compute exact
+Tanimoto, and update the top-k min-heap.
+
+The streaming cursor is verified against an exhaustive linear scan in the test
+suite (identical results across many queries × thresholds).
 
 ## Usage
 
@@ -89,14 +102,23 @@ bitmako ingest        --input REAL.cxsmiles.bz2 --output compounds.lance
 # 2. Build the inverted index (multi-pass, memory-bounded)
 bitmako build-index   --lance compounds.lance   --output compounds.bitmako --bits-per-pass 64
 
-# 3. Build the flat fingerprint store
+# 3. Build the skip index from the index (single pass, no rebuild)
+bitmako build-skip    --index compounds.bitmako --output compounds.skip
+
+# 4. Build the flat fingerprint store
 bitmako build-fp-store --lance compounds.lance  --output compounds.fp
 
-# 4. Search
-bitmako search --index compounds.bitmako --fp-store compounds.fp \
-    --query "CC(=O)Oc1ccccc1C(=O)O" --threshold 0.8 --top-k 10 \
+# 5. Search
+bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --query "OC(=O)c1ccccc1" --threshold 0.3 --top-k 10 \
     [--mw-max 500 --logp-max 5]
 ```
+
+> **Tanimoto is size-sensitive.** A small query (few set bits) can't reach a high
+> Tanimoto against the large building-block compounds in REAL — even full
+> containment of a ~12-bit fragment in a ~40-bit compound scores only ~0.3. Pick a
+> threshold appropriate to your query's size, or query molecules of similar size to
+> the corpus.
 
 ### `build-index` is memory-bounded
 
@@ -116,18 +138,43 @@ posting section can exceed 4 GiB (the full build is ~70 GB).
 [posting-list data: per bit, 128-doc blocks of delta+varint doc_ids]
 ```
 
+**Skip index (`*.skip`):** sidecar for streaming traversal. Per block, per bit, it
+stores the decoder base and byte offset so a cursor can jump to the block holding a
+target doc_id without decoding the list. Built in one pass over the index (~9 min
+for the 70 GB index; ~6 GB output) — no rebuild required.
+
+```
+[8B magic "BMSKIP01"][4B version][4B num_bits]
+[num_bits × { num_blocks: u32, data_off: u64 }]          // directory
+[per bit: num_blocks × { base: u32, byte_offset: u64 }]
+```
+
 **Fingerprint store (`*.fp`):** flat array of `num_compounds × [u64; 16]`, little
 -endian, indexed directly by `doc_id`. Memory-mapped at search time.
 
+## Search performance
+
+Measured on the full 1.36B-compound build, single workstation (32 GB RAM, cold
+cache), before and after the streaming skip-cursor:
+
+| Query | Before (full decode) | After (streaming + skip) |
+|---|---|---|
+| Aspirin @ 0.8 | 1097 s, ~26 GB RAM | 210 s, ~1 GB RAM |
+| Medium drug-like @ 0.7 | **OOM crash** (8 GB alloc) | 341 s, ~1.3 GB RAM |
+| Benzoic acid @ 0.2 (10 hits) | — | 105 s, ~2.8 GB RAM |
+
+The decode/OOM bottleneck is gone — peak memory is now bounded by the query, not
+the corpus. Remaining latency for low-threshold or common-fragment queries is
+dominated by cold random fingerprint fetches from the 163 GB flat store (one disk
+seek per surviving candidate); these benefit directly from page-cache warmth, an
+SSD, or more RAM.
+
 ## Known limitations / next steps
 
-- **Common-fragment queries are slow.** The engine fully decodes each active-bit
-  posting list into a `Vec<u32>` before walking it. For a query whose fragments are
-  common across the corpus (e.g. aspirin's benzene + carbonyl bits), those lists run
-  to hundreds of millions of entries, so decoding dominates — an aspirin query over
-  the full 1.36B set took ~19 min (cold cache) and ~25 GB RAM. The fix is to iterate
-  the varint stream directly and use block-max metadata to skip blocks without
-  decoding them. Selective (drug-like, rarer-fragment) queries are far cheaper.
+- **Cold fingerprint fetches dominate large candidate sets.** Each pivot that
+  survives the count-based upper bound triggers a random 128-byte read from the flat
+  store. For low thresholds / small queries this is the main cost; a fingerprint
+  cache or property pre-filter would cut it.
 - **Results are `doc_id`s, not SMILES.** Mapping back to compound IDs requires a join
   against the Lance dataset; not yet wired into the `search` command.
 - **Property filters** (`--mw-max`, `--logp-max`) are parsed into the query but the

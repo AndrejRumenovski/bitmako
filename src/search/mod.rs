@@ -11,6 +11,7 @@ use tracing::info;
 
 use crate::error::Result;
 use crate::etl::fingerprint::compute_morgan_fp;
+use crate::index::skip::SkipIndex;
 use crate::index::IndexReader;
 use crate::search::fp_store::FpStore;
 use crate::search::query::SimilarityQuery;
@@ -23,36 +24,39 @@ use crate::search::wand::BmwEngine;
 /// candidate above the current threshold, so the resident set stays small.
 pub struct Searcher {
     index: IndexReader,
+    /// Skip index for streaming, block-at-a-time posting-list traversal.
+    skip: SkipIndex,
     /// Memory-mapped flat fingerprint store for O(1) access by doc_id
     fp_store: FpStore,
 }
 
 impl Searcher {
-    /// Load the index and fingerprint store from disk.
-    pub fn open(index_path: &Path, fp_store_path: &Path) -> Result<Self> {
+    /// Load the index, skip index, and fingerprint store from disk.
+    pub fn open(index_path: &Path, skip_path: &Path, fp_store_path: &Path) -> Result<Self> {
         let index = IndexReader::open(index_path)?;
+        let skip = SkipIndex::open(skip_path)?;
         let fp_store = FpStore::open(fp_store_path)?;
         info!(
             "Searcher ready: {} compounds indexed, {} fingerprints in store",
             index.num_compounds,
             fp_store.len()
         );
-        Ok(Searcher { index, fp_store })
+        Ok(Searcher { index, skip, fp_store })
     }
 
-    /// Construct a Searcher from an already-loaded IndexReader and fingerprint store.
-    pub fn open_from_index(index: IndexReader, fp_store: FpStore) -> Self {
+    /// Construct a Searcher from already-loaded components.
+    pub fn open_from_index(index: IndexReader, skip: SkipIndex, fp_store: FpStore) -> Self {
         info!(
             "Searcher ready: {} compounds indexed, {} fingerprints in store",
             index.num_compounds,
             fp_store.len()
         );
-        Searcher { index, fp_store }
+        Searcher { index, skip, fp_store }
     }
 
     /// Execute a similarity search returning top-k results.
     pub fn search(&self, query: &SimilarityQuery) -> Result<Vec<(u32, f32)>> {
-        let engine = BmwEngine::new(&self.index);
+        let engine = BmwEngine::new(&self.index, &self.skip);
         let results = engine.search(query, |doc_id| self.fp_store.get(doc_id))?;
         Ok(results)
     }

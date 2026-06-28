@@ -142,6 +142,83 @@ impl PostingList {
     }
 }
 
+/// Read the `u32 num_blocks` header at the start of a serialized posting list.
+/// Returns `(num_blocks, position_after_header)`.
+#[inline]
+pub fn num_blocks_at(data: &[u8]) -> (u32, usize) {
+    let n = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    (n, 4)
+}
+
+/// Read a single LEB128 varint directly from `data` at `pos` (no Cursor/io
+/// overhead — this is the hot path for streaming decode).
+/// Returns `(value, new_pos)`.
+#[inline]
+pub fn read_varint_at(data: &[u8], mut pos: usize) -> (u32, usize) {
+    let mut result = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let b = data[pos];
+        pos += 1;
+        result |= ((b & 0x7F) as u32) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    (result, pos)
+}
+
+/// Decode one block beginning at byte `pos`, given the decoder `base`
+/// (the absolute doc_id the block's first delta is relative to — i.e. the last
+/// doc_id of the previous block, or 0 for the first block).
+///
+/// The decoded doc_ids are written into `out` (which is cleared first).
+/// Returns `(max_pop, next_pos, last_doc_id)`.
+#[inline]
+pub fn decode_block(
+    data: &[u8],
+    pos: usize,
+    mut base: u32,
+    out: &mut Vec<u32>,
+) -> (u8, usize, u32) {
+    let max_pop = data[pos];
+    let len = data[pos + 1] as usize;
+    let mut p = pos + 2;
+    out.clear();
+    for _ in 0..len {
+        let (delta, np) = read_varint_at(data, p);
+        p = np;
+        base = base.wrapping_add(delta);
+        out.push(base);
+    }
+    (max_pop, p, base)
+}
+
+/// Walk a serialized posting list and produce one skip entry per block:
+/// `(base, byte_offset)` where `base` is the decoder base entering the block
+/// (last doc_id of the previous block; 0 for block 0) and `byte_offset` is the
+/// position of the block header within `list_bytes`.
+///
+/// `base` values are strictly the previous block's last doc_id, so the array is
+/// ascending and can be binary-searched to locate the block containing a target.
+pub fn build_skip_entries(list_bytes: &[u8]) -> Vec<(u32, u64)> {
+    if list_bytes.len() < 4 {
+        return Vec::new();
+    }
+    let (num_blocks, mut pos) = num_blocks_at(list_bytes);
+    let mut entries = Vec::with_capacity(num_blocks as usize);
+    let mut base = 0u32;
+    let mut buf: Vec<u32> = Vec::with_capacity(BLOCK_SIZE);
+    for _ in 0..num_blocks {
+        entries.push((base, pos as u64));
+        let (_max_pop, next_pos, last_doc) = decode_block(list_bytes, pos, base, &mut buf);
+        pos = next_pos;
+        base = last_doc;
+    }
+    entries
+}
+
 /// Variable-length integer encoding (LEB128 style, little-endian)
 fn write_varint(out: &mut Vec<u8>, mut value: u32) -> io::Result<()> {
     loop {
@@ -214,5 +291,30 @@ mod tests {
         let bytes = pl.serialize().unwrap();
         let restored = PostingList::deserialize(&bytes).unwrap();
         assert_eq!(restored.doc_ids, ids);
+    }
+
+    #[test]
+    fn test_streaming_decode_matches_full() {
+        // Multi-block list; stream block-by-block and confirm identical doc_ids,
+        // and that skip-entry bases equal each block's preceding last doc_id.
+        let ids: Vec<u32> = (0..500u32).map(|i| i * 7 + (i % 3)).collect();
+        let pops: Vec<u8> = vec![5u8; 4];
+        let pl = PostingList { doc_ids: ids.clone(), block_max_pop: pops };
+        let bytes = pl.serialize().unwrap();
+
+        let skips = build_skip_entries(&bytes);
+        let (num_blocks, _) = num_blocks_at(&bytes);
+        assert_eq!(skips.len(), num_blocks as usize);
+
+        let mut all = Vec::new();
+        let mut buf = Vec::new();
+        for (i, &(base, off)) in skips.iter().enumerate() {
+            // The base entering block i must be the last doc of block i-1 (0 for i=0).
+            let expected_base = if i == 0 { 0 } else { ids[i * BLOCK_SIZE - 1] };
+            assert_eq!(base, expected_base, "block {} base", i);
+            let (_mp, _np, _last) = decode_block(&bytes, off as usize, base, &mut buf);
+            all.extend_from_slice(&buf);
+        }
+        assert_eq!(all, ids);
     }
 }
