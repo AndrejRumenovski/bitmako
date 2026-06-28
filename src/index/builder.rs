@@ -16,7 +16,7 @@ use crate::index::posting_list::{PostingList, BLOCK_SIZE};
 
 /// On-disk index format constants
 const INDEX_MAGIC: &[u8; 8] = b"BITMAKO1";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2; // v2: 8-byte u64 offsets (v1 used 4-byte u32)
 
 /// Accumulates compound fingerprints and builds posting lists incrementally.
 pub struct IndexBuilder {
@@ -100,7 +100,7 @@ impl IndexBuilder {
     ///   [4-byte version]
     ///   [4-byte num_compounds]
     ///   [4-byte num_bits = 1024]
-    ///   [4-byte * 1024: byte offsets to each posting list from start of postings section]
+    ///   [8-byte * 1024: byte offsets to each posting list from start of postings section]
     ///   [4-byte * num_compounds: compound_pops, packed as u8 → padded to u32 alignment]
     ///   [posting list data for bits 0..1023]
     pub fn write_index(mut self, output_path: &Path) -> Result<IndexStats> {
@@ -115,13 +115,12 @@ impl IndexBuilder {
             serialized_lists.push(pl.serialize().map_err(BitMakoError::Io)?);
         }
 
-        // Compute offsets
-        let mut offsets: Vec<u32> = Vec::with_capacity(FP_BITS);
-        let mut running_offset: u32 = 0;
+        // Compute offsets (u64 to support >4 GiB posting sections)
+        let mut offsets: Vec<u64> = Vec::with_capacity(FP_BITS);
+        let mut running_offset: u64 = 0;
         for data in &serialized_lists {
             offsets.push(running_offset);
-            running_offset = running_offset.checked_add(data.len() as u32)
-                .ok_or_else(|| BitMakoError::IndexBuild("index too large for u32 offset".into()))?;
+            running_offset += data.len() as u64;
         }
 
         // Write header
@@ -130,7 +129,7 @@ impl IndexBuilder {
         file.write_all(&self.num_compounds.to_le_bytes())?;
         file.write_all(&(FP_BITS as u32).to_le_bytes())?;
 
-        // Write offsets table
+        // Write offsets table (8 bytes each)
         for off in &offsets {
             file.write_all(&off.to_le_bytes())?;
         }

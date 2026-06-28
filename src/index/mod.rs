@@ -52,11 +52,12 @@ impl IndexReader {
         cursor.read_exact(&mut buf4).map_err(BitMakoError::Io)?;
         let num_bits = u32::from_le_bytes(buf4);
 
-        // Read offsets
-        let mut offsets = vec![0u32; num_bits as usize];
+        // Read offsets (u64, 8 bytes each)
+        let mut offsets = vec![0u64; num_bits as usize];
         for off in offsets.iter_mut() {
-            cursor.read_exact(&mut buf4).map_err(BitMakoError::Io)?;
-            *off = u32::from_le_bytes(buf4);
+            let mut buf8 = [0u8; 8];
+            cursor.read_exact(&mut buf8).map_err(BitMakoError::Io)?;
+            *off = u64::from_le_bytes(buf8);
         }
 
         // Read compound pops
@@ -85,6 +86,7 @@ impl IndexReader {
                 .map_err(BitMakoError::Io)?;
             posting_lists.push(pl);
         }
+
 
         info!(
             "Loaded index: {} compounds, {} bits",
