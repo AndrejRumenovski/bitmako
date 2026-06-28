@@ -49,9 +49,10 @@ fn main() {
         "build-skip" => cmd_build_skip(&args[2..]),
         "build-fp-store" => cmd_build_fp_store(&args[2..]),
         "search" => cmd_search(&args[2..]),
+        "verify" => cmd_verify(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|search> [options]");
+            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|search|verify> [options]");
             process::exit(1);
         }
     };
@@ -446,6 +447,83 @@ fn cmd_search(args: &[String]) -> Result<()> {
         println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
     }
     Ok(())
+}
+
+/// `verify --index <index.bitmako> --fp-store <store.fp> [--sample N]`
+///
+/// Cross-checks that the inverted index and the flat fingerprint store agree on
+/// `doc_id`s. The index's per-compound popcount table comes from the build-index
+/// Lance scan; the fingerprint store comes from a *separate* build-fp-store scan.
+/// If both scans visited compounds in the same order, then for every `doc_id`
+/// `popcount(fp_store[doc_id]) == compound_pops[doc_id]`. A mismatch means the
+/// scans diverged and exact-Tanimoto would be computed against the wrong compound.
+///
+/// Popcount equality is a *necessary* condition: a real reordering would have to
+/// preserve every compound's exact popcount to slip through, which across 1.4B
+/// rows is astronomically unlikely — so a clean full scan is strong proof of
+/// alignment. `--sample N` checks the first N doc_ids (sequential, fast) instead.
+fn cmd_verify(args: &[String]) -> Result<()> {
+    use bitmako::etl::fingerprint::fp_popcount;
+    use bitmako::search::fp_store::FpStore;
+
+    let index_path = PathBuf::from(require_flag(args, "--index"));
+    let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
+    let sample: Option<usize> = flag_value(args, "--sample").and_then(|s| s.parse().ok());
+
+    let index = IndexReader::open(&index_path)?;
+    let fp_store = FpStore::open(&fp_store_path)?;
+
+    let n_index = index.num_compounds as usize;
+    let n_fp = fp_store.len();
+    info!("Index compounds: {}, fp-store fingerprints: {}", n_index, n_fp);
+    if n_index != n_fp {
+        println!(
+            "FAIL: count mismatch — index has {} compounds, fp-store has {}",
+            n_index, n_fp
+        );
+        return Err(bitmako::error::BitMakoError::IndexBuild(
+            "index/fp-store compound counts differ".into(),
+        ));
+    }
+
+    let limit = match sample {
+        Some(s) if s > 0 && s < n_index => s,
+        _ => n_index,
+    };
+    info!("Verifying popcount alignment over {} doc_ids (sequential)...", limit);
+
+    let mut mismatches: u64 = 0;
+    let mut first_bad: Vec<(u32, u8, u32)> = Vec::new();
+
+    for d in 0..limit {
+        let doc = d as u32;
+        let expected = index.compound_pop(doc) as u32;
+        let got = fp_store.get(doc).map(|fp| fp_popcount(&fp)).unwrap_or(u32::MAX);
+        if got != expected {
+            mismatches += 1;
+            if first_bad.len() < 10 {
+                first_bad.push((doc, expected as u8, got));
+            }
+        }
+        if (d + 1) % 100_000_000 == 0 {
+            info!("Verified {} / {} ({} mismatches so far)", d + 1, limit, mismatches);
+        }
+    }
+
+    if mismatches == 0 {
+        info!("ALIGNMENT OK: {} doc_ids checked, all popcounts match", limit);
+        println!("OK: {} doc_ids checked — index and fp-store are aligned", limit);
+        Ok(())
+    } else {
+        for (doc, exp, got) in &first_bad {
+            println!("  MISMATCH doc_id={} index_pop={} fp_pop={}", doc, exp, got);
+        }
+        println!("FAIL: {} of {} checked doc_ids mismatched", mismatches, limit);
+        Err(bitmako::error::BitMakoError::IndexBuild(format!(
+            "{} popcount mismatches — index and fp-store are NOT aligned",
+            mismatches
+        )))
+    }
 }
 
 fn require_flag(args: &[String], flag: &str) -> String {
