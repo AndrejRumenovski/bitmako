@@ -5,7 +5,7 @@
 //!   bitmako build-index    --lance <dataset.lance> --output <index.bitmako>
 //!   bitmako build-skip     --index <index.bitmako> --output <index.skip>
 //!   bitmako build-fp-store --lance <dataset.lance> --output <store.fp>
-//!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> --threshold 0.7 --top-k 100
+//!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> [--lance <dataset.lance>] --threshold 0.7 --top-k 100
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> --mw-max 500 --logp-max 5
 
 use std::path::PathBuf;
@@ -399,8 +399,12 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `search --index <index.bitmako> --fp-store <store.fp> --query <SMILES> --threshold 0.7 --top-k 50`
-/// Optional: `--mw-max 500 --logp-max 5`
+/// `search --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES>`
+/// Optional: `--lance <dataset.lance>` `--threshold 0.7` `--top-k 50` `--mw-max 500` `--logp-max 5`
+///
+/// Without `--lance`, prints doc_id + Tanimoto score only.
+/// With `--lance`, resolves each doc_id to compound_id, SMILES, and molecular properties
+/// via `Dataset::take` (random-access row lookup — no full scan).
 fn cmd_search(args: &[String]) -> Result<()> {
     let index_path = PathBuf::from(require_flag(args, "--index"));
     let skip_path = PathBuf::from(require_flag(args, "--skip"));
@@ -414,6 +418,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
         .unwrap_or(50);
     let mw_max: Option<f32> = flag_value(args, "--mw-max").and_then(|s| s.parse().ok());
     let logp_max: Option<f32> = flag_value(args, "--logp-max").and_then(|s| s.parse().ok());
+    let lance_path: Option<String> = flag_value(args, "--lance");
 
     let index = IndexReader::open(&index_path)?;
     info!("Loaded index: {} compounds", index.num_compounds);
@@ -443,9 +448,69 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let results = searcher.search(&query)?;
 
     println!("Found {} results above threshold {}", results.len(), threshold);
-    for (rank, (doc_id, score)) in results.iter().enumerate() {
-        println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
+
+    if results.is_empty() {
+        return Ok(());
     }
+
+    if let Some(lance_str) = lance_path {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(bitmako::error::BitMakoError::Io)?;
+
+        rt.block_on(async {
+            use lance::dataset::Dataset;
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::{Float32Type, UInt32Type};
+
+            let dataset = Dataset::open(&lance_str)
+                .await
+                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+
+            let row_indices: Vec<u64> = results.iter().map(|(d, _)| *d as u64).collect();
+
+            let projection = dataset
+                .schema()
+                .project(&["compound_id", "smiles", "mw", "logp", "rot_bonds", "heavy_atoms", "ring_count"])
+                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+
+            let batch = dataset
+                .take(&row_indices, projection)
+                .await
+                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+
+            let cid_col = batch.column_by_name("compound_id").unwrap().as_string::<i32>();
+            let smi_col = batch.column_by_name("smiles").unwrap().as_string::<i32>();
+            let mw_col  = batch.column_by_name("mw").unwrap().as_primitive::<Float32Type>();
+            let logp_col = batch.column_by_name("logp").unwrap().as_primitive::<Float32Type>();
+            let rot_col  = batch.column_by_name("rot_bonds").unwrap().as_primitive::<UInt32Type>();
+            let heavy_col = batch.column_by_name("heavy_atoms").unwrap().as_primitive::<UInt32Type>();
+            let ring_col = batch.column_by_name("ring_count").unwrap().as_primitive::<UInt32Type>();
+
+            for (rank, ((_doc_id, score), i)) in results.iter().zip(0usize..).enumerate() {
+                println!(
+                    "#{}: compound={} score={:.4} smiles={} mw={:.1} logp={:.2} rot_bonds={} heavy_atoms={} rings={}",
+                    rank + 1,
+                    cid_col.value(i),
+                    score,
+                    smi_col.value(i),
+                    mw_col.value(i),
+                    logp_col.value(i),
+                    rot_col.value(i),
+                    heavy_col.value(i),
+                    ring_col.value(i),
+                );
+            }
+
+            Ok::<(), bitmako::error::BitMakoError>(())
+        })?;
+    } else {
+        for (rank, (doc_id, score)) in results.iter().enumerate() {
+            println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
+        }
+    }
+
     Ok(())
 }
 
