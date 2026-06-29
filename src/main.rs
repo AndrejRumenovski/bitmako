@@ -16,7 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use bitmako::error::Result;
 use bitmako::etl::{PipelineConfig, run_pipeline};
-use bitmako::etl::fingerprint::compute_morgan_fp;
+use bitmako::etl::fingerprint::{compute_morgan_fp, fp_popcount};
 use bitmako::etl::reader::ReaderConfig;
 use bitmako::index::IndexReader;
 use bitmako::search::query::{PropertyField, PropertyFilter, SimilarityQuery};
@@ -428,6 +428,24 @@ fn cmd_search(args: &[String]) -> Result<()> {
     info!("Query SMILES: '{}' threshold={} top_k={}", query_smiles, threshold, top_k);
 
     let query_fp = compute_morgan_fp(&query_smiles);
+    let query_pop = fp_popcount(&query_fp);
+
+    // Enamine REAL compounds average ~45 set bits. For a P-bit query fully
+    // contained in a K-bit compound, max Tanimoto = P/K. This gives a rough
+    // upper bound on what's achievable in practice for sparse queries.
+    let est_max_tanimoto = (query_pop as f32 / 45.0_f32).min(1.0);
+    println!(
+        "Query pop={} bits | est. max Tanimoto against 45-bit corpus compound: {:.2}",
+        query_pop, est_max_tanimoto
+    );
+    if threshold > est_max_tanimoto + 0.02 {
+        println!(
+            "WARNING: threshold {:.2} likely exceeds max achievable for this query (est. {:.2}); \
+             search may return 0 results. Consider threshold <= {:.2}.",
+            threshold, est_max_tanimoto, est_max_tanimoto
+        );
+    }
+
     let mut query = SimilarityQuery::new(query_fp, threshold, top_k);
 
     if let Some(max) = mw_max {

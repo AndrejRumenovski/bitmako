@@ -152,6 +152,12 @@ impl<'a> StreamCursor<'a> {
     }
 }
 
+/// Maximum consecutive main-loop iterations without a heap update before returning
+/// early. Prevents pathological 40+ second searches when the threshold is
+/// unreachable (e.g. a small-molecule query at high similarity against a large-
+/// fragment corpus where the heap never fills and the dynamic threshold never rises).
+const EARLY_EXIT_STALE_LIMIT: u64 = 50_000_000;
+
 /// Block-Max WAND execution engine
 pub struct BmwEngine<'a> {
     index: &'a IndexReader,
@@ -211,6 +217,7 @@ impl<'a> BmwEngine<'a> {
         let p = query.query_pop;
         let mut docs_evaluated: u64 = 0;
         let mut pivots_skipped: u64 = 0;
+        let mut stale_iters: u64 = 0;
 
         // Minimum number of query bits a candidate must share to possibly reach
         // `t`. A doc sharing `c` query bits has popcount K ≥ c, so its Tanimoto is
@@ -248,6 +255,7 @@ impl<'a> BmwEngine<'a> {
                 let denom = p + k - c;
                 let ub = if denom == 0 { 0.0 } else { c as f32 / denom as f32 };
 
+                let mut heap_updated = false;
                 if ub >= threshold {
                     if let Some(fp) = get_fingerprint(pivot_doc) {
                         let (score, meets) =
@@ -266,6 +274,7 @@ impl<'a> BmwEngine<'a> {
                                     threshold = threshold.max(worst.score.0);
                                 }
                             }
+                            heap_updated = true;
                         }
                     }
                 } else {
@@ -278,16 +287,31 @@ impl<'a> BmwEngine<'a> {
                         cursor.advance_to(pivot_doc + 1);
                     }
                 }
+
+                if heap_updated {
+                    stale_iters = 0;
+                } else {
+                    stale_iters += 1;
+                }
             } else {
                 // Not aligned: skip a trailing cursor forward to the pivot. Docs
                 // below the pivot appear in < θ lists, so none can qualify.
                 pivots_skipped += 1;
+                stale_iters += 1;
                 for cursor in cursors.iter_mut() {
                     if cursor.current_doc().map(|d| d < pivot_doc).unwrap_or(false) {
                         cursor.advance_to(pivot_doc);
                         break;
                     }
                 }
+            }
+
+            if stale_iters >= EARLY_EXIT_STALE_LIMIT {
+                debug!(
+                    "WAND early exit: {} stale iterations without heap update (threshold={:.3})",
+                    stale_iters, threshold
+                );
+                break;
             }
         }
 
