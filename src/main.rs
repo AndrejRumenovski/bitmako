@@ -402,9 +402,12 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
 /// `search --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES>`
 /// Optional: `--lance <dataset.lance>` `--threshold 0.7` `--top-k 50` `--mw-max 500` `--logp-max 5`
 ///
-/// Without `--lance`, prints doc_id + Tanimoto score only.
+/// Without `--lance`, prints doc_id + Tanimoto score only (property filters not available).
 /// With `--lance`, resolves each doc_id to compound_id, SMILES, and molecular properties
 /// via `Dataset::take` (random-access row lookup — no full scan).
+///
+/// Property filters (`--mw-max`, `--logp-max`) require `--lance`. WAND over-fetches 20×
+/// so the post-filter pass has enough candidates to fill top_k after dropping non-matches.
 fn cmd_search(args: &[String]) -> Result<()> {
     let index_path = PathBuf::from(require_flag(args, "--index"));
     let skip_path = PathBuf::from(require_flag(args, "--skip"));
@@ -442,12 +445,26 @@ fn cmd_search(args: &[String]) -> Result<()> {
         });
     }
 
+    let has_filters = !query.property_filters.is_empty();
+
+    if has_filters && lance_path.is_none() {
+        eprintln!("error: --lance <dataset.lance> is required when --mw-max or --logp-max are specified");
+        process::exit(1);
+    }
+
+    // Over-fetch from WAND when property filters are active so the Lance post-filter
+    // pass has enough candidates to fill top_k after dropping non-matching compounds.
+    let mut search_query = query.clone();
+    if has_filters {
+        search_query.top_k = top_k.saturating_mul(20);
+    }
+
     let skip = bitmako::index::skip::SkipIndex::open(&skip_path)?;
     let fp_store = bitmako::search::fp_store::FpStore::open(&fp_store_path)?;
     let searcher = Searcher::open_from_index(index, skip, fp_store);
-    let results = searcher.search(&query)?;
+    let results = searcher.search(&search_query)?;
 
-    println!("Found {} results above threshold {}", results.len(), threshold);
+    println!("Found {} candidates above threshold {}", results.len(), threshold);
 
     if results.is_empty() {
         return Ok(());
@@ -463,6 +480,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
             use lance::dataset::Dataset;
             use arrow_array::cast::AsArray;
             use arrow_array::types::{Float32Type, UInt32Type};
+            use bitmako::etl::properties::MolecularProperties;
 
             let dataset = Dataset::open(&lance_str)
                 .await
@@ -480,27 +498,47 @@ fn cmd_search(args: &[String]) -> Result<()> {
                 .await
                 .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
 
-            let cid_col = batch.column_by_name("compound_id").unwrap().as_string::<i32>();
-            let smi_col = batch.column_by_name("smiles").unwrap().as_string::<i32>();
-            let mw_col  = batch.column_by_name("mw").unwrap().as_primitive::<Float32Type>();
-            let logp_col = batch.column_by_name("logp").unwrap().as_primitive::<Float32Type>();
-            let rot_col  = batch.column_by_name("rot_bonds").unwrap().as_primitive::<UInt32Type>();
+            let cid_col   = batch.column_by_name("compound_id").unwrap().as_string::<i32>();
+            let smi_col   = batch.column_by_name("smiles").unwrap().as_string::<i32>();
+            let mw_col    = batch.column_by_name("mw").unwrap().as_primitive::<Float32Type>();
+            let logp_col  = batch.column_by_name("logp").unwrap().as_primitive::<Float32Type>();
+            let rot_col   = batch.column_by_name("rot_bonds").unwrap().as_primitive::<UInt32Type>();
             let heavy_col = batch.column_by_name("heavy_atoms").unwrap().as_primitive::<UInt32Type>();
-            let ring_col = batch.column_by_name("ring_count").unwrap().as_primitive::<UInt32Type>();
+            let ring_col  = batch.column_by_name("ring_count").unwrap().as_primitive::<UInt32Type>();
 
-            for (rank, ((_doc_id, score), i)) in results.iter().zip(0usize..).enumerate() {
+            // Walk candidates in descending score order; apply property filters; stop at top_k.
+            let mut shown = 0usize;
+            for (i, (_, score)) in results.iter().enumerate() {
+                let props = MolecularProperties {
+                    mw:          mw_col.value(i),
+                    logp:        logp_col.value(i),
+                    rot_bonds:   rot_col.value(i),
+                    heavy_atoms: heavy_col.value(i),
+                    ring_count:  ring_col.value(i),
+                };
+                if has_filters && !query.filter_passes(&props) {
+                    continue;
+                }
+                shown += 1;
                 println!(
                     "#{}: compound={} score={:.4} smiles={} mw={:.1} logp={:.2} rot_bonds={} heavy_atoms={} rings={}",
-                    rank + 1,
+                    shown,
                     cid_col.value(i),
                     score,
                     smi_col.value(i),
-                    mw_col.value(i),
-                    logp_col.value(i),
-                    rot_col.value(i),
-                    heavy_col.value(i),
-                    ring_col.value(i),
+                    props.mw,
+                    props.logp,
+                    props.rot_bonds,
+                    props.heavy_atoms,
+                    props.ring_count,
                 );
+                if shown == top_k {
+                    break;
+                }
+            }
+
+            if has_filters {
+                println!("({} of {} WAND candidates passed property filter)", shown, results.len());
             }
 
             Ok::<(), bitmako::error::BitMakoError>(())

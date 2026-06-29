@@ -108,10 +108,20 @@ bitmako build-skip    --index compounds.bitmako --output compounds.skip
 # 4. Build the flat fingerprint store
 bitmako build-fp-store --lance compounds.lance  --output compounds.fp
 
-# 5. Search
+# 5. Search (doc_id + Tanimoto only)
 bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
-    --query "OC(=O)c1ccccc1" --threshold 0.3 --top-k 10 \
-    [--mw-max 500 --logp-max 5]
+    --query "OC(=O)c1ccccc1" --threshold 0.3 --top-k 10
+
+# 5b. Search with SMILES / property lookup (add --lance)
+bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --lance compounds.lance \
+    --query "OC(=O)c1ccccc1" --threshold 0.3 --top-k 10
+
+# 5c. Search with property filters (requires --lance)
+bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --lance compounds.lance \
+    --query "OC(=O)c1ccccc1" --threshold 0.1 --top-k 10 \
+    --mw-max 350 --logp-max 3
 ```
 
 > **Tanimoto is size-sensitive.** A small query (few set bits) can't reach a high
@@ -175,10 +185,13 @@ SSD, or more RAM.
   survives the count-based upper bound triggers a random 128-byte read from the flat
   store. For low thresholds / small queries this is the main cost; a fingerprint
   cache or property pre-filter would cut it.
-- **Results are `doc_id`s, not SMILES.** Mapping back to compound IDs requires a join
-  against the Lance dataset; not yet wired into the `search` command.
-- **Property filters** (`--mw-max`, `--logp-max`) are parsed into the query but the
-  property columns aren't yet loaded during search.
+- **Property filters with `--lance` over-fetch 20×.** When `--mw-max` / `--logp-max`
+  are combined with a high `--top-k`, WAND fetches `top_k × 20` candidates and
+  post-filters via Lance. If the filter is very restrictive you may get fewer than
+  `top_k` results; increase `--top-k` to compensate.
+- **WAND is slow at 0 results.** At high thresholds with no matches the dynamic
+  threshold never rises, so pruning stays weak. Small queries (aspirin-sized) at
+  threshold ≥ 0.9 can take ~40 s.
 
 ## Testing
 
