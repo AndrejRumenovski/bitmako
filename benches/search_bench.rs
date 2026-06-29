@@ -11,6 +11,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use bitmako::etl::fingerprint::{compute_morgan_fp, fp_popcount, Fingerprint};
 use bitmako::index::builder::IndexBuilder;
 use bitmako::index::posting_list::PostingList;
+use bitmako::index::skip::SkipIndex;
 use bitmako::index::IndexReader;
 use bitmako::search::query::SimilarityQuery;
 use bitmako::search::tanimoto::{tanimoto, tanimoto_upper_bound};
@@ -30,7 +31,7 @@ const BENCH_SMILES: &[&str] = &[
 ];
 
 /// Build a test index with synthetic compounds (from repeated BENCH_SMILES)
-fn build_bench_index(n_compounds: usize) -> (Vec<Fingerprint>, tempfile::NamedTempFile) {
+fn build_bench_index(n_compounds: usize) -> (Vec<Fingerprint>, tempfile::NamedTempFile, SkipIndex) {
     let fps: Vec<Fingerprint> = BENCH_SMILES
         .iter()
         .cycle()
@@ -45,7 +46,9 @@ fn build_bench_index(n_compounds: usize) -> (Vec<Fingerprint>, tempfile::NamedTe
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     builder.write_index(tmp.path()).unwrap();
-    (fps, tmp)
+    let index = IndexReader::open(tmp.path()).unwrap();
+    let skip = SkipIndex::build_in_memory(&index).unwrap();
+    (fps, tmp, skip)
 }
 
 fn bench_tanimoto(c: &mut Criterion) {
@@ -113,9 +116,9 @@ fn bench_posting_list_roundtrip(c: &mut Criterion) {
 
 fn bench_bmw_search(c: &mut Criterion) {
     let n_compounds = 10_000;
-    let (fps, tmp) = build_bench_index(n_compounds);
+    let (fps, tmp, skip) = build_bench_index(n_compounds);
     let index = IndexReader::open(tmp.path()).unwrap();
-    let engine = BmwEngine::new(&index);
+    let engine = BmwEngine::new(&index, &skip);
 
     let query_fp = compute_morgan_fp("CC(=O)Oc1ccccc1C(=O)O"); // aspirin
     let fps_ref = &fps;
@@ -146,9 +149,9 @@ fn bench_bmw_scale(c: &mut Criterion) {
     let query_fp = compute_morgan_fp("c1ccccc1");
 
     for n_compounds in [1_000usize, 10_000, 100_000] {
-        let (fps, tmp) = build_bench_index(n_compounds);
+        let (fps, tmp, skip) = build_bench_index(n_compounds);
         let index = IndexReader::open(tmp.path()).unwrap();
-        let engine = BmwEngine::new(&index);
+        let engine = BmwEngine::new(&index, &skip);
         let fps_ref = fps.clone();
         let query = SimilarityQuery::new(query_fp, 0.7, 50);
 
