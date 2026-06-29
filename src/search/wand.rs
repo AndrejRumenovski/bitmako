@@ -182,6 +182,30 @@ impl<'a> BmwEngine<'a> {
         query: &SimilarityQuery,
         get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
     ) -> Result<Vec<(u32, f32)>> {
+        self.search_inner(query, get_fingerprint, |_| true)
+    }
+
+    /// Like [`search`](Self::search), but applies `passes_filter` as a cheap
+    /// pre-screen inside the pivot loop — evaluated *before* the fingerprint fetch
+    /// so property filtering costs an O(1) memory-mapped read instead of a 128-byte
+    /// random fingerprint read. Compounds failing the filter never reach the heap,
+    /// so the dynamic threshold rises only on results satisfying both the Tanimoto
+    /// threshold and the property filters, and `top_k` comes back already filtered.
+    pub fn search_filtered(
+        &self,
+        query: &SimilarityQuery,
+        get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
+        passes_filter: impl Fn(u32) -> bool,
+    ) -> Result<Vec<(u32, f32)>> {
+        self.search_inner(query, get_fingerprint, passes_filter)
+    }
+
+    fn search_inner(
+        &self,
+        query: &SimilarityQuery,
+        get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
+        passes_filter: impl Fn(u32) -> bool,
+    ) -> Result<Vec<(u32, f32)>> {
         validate_query(query)?;
 
         let active_bits = query.active_bits();
@@ -256,7 +280,10 @@ impl<'a> BmwEngine<'a> {
                 let ub = if denom == 0 { 0.0 } else { c as f32 / denom as f32 };
 
                 let mut heap_updated = false;
-                if ub >= threshold {
+                // Property pre-screen: an O(1) mmap read that gates the far more
+                // expensive random fingerprint fetch below. Compounds failing the
+                // filter are dropped here without ever touching the fp store.
+                if ub >= threshold && passes_filter(pivot_doc) {
                     if let Some(fp) = get_fingerprint(pivot_doc) {
                         let (score, meets) =
                             tanimoto_with_threshold(&query.query_fp, &fp, threshold);
@@ -483,6 +510,63 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_search_filtered_excludes_rejected_docs() {
+        // doc 0 (CCO) is the exact-match top hit. With a predicate that rejects
+        // doc 0, search_filtered must drop it entirely and never let it reach the
+        // heap, while still returning the remaining qualifying compounds.
+        let smiles = ["CCO", "CCCO", "CCCCO", "CCCCCO"];
+        let (fps, index, skip, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index, &skip);
+        let query_fp = compute_morgan_fp("CCO");
+        let query = SimilarityQuery::new(query_fp, 0.0, 100);
+
+        let unfiltered = engine
+            .search(&query, |doc_id| fps.get(doc_id as usize).copied())
+            .unwrap();
+        assert_eq!(unfiltered[0].0, 0, "expected exact match at doc 0");
+
+        let filtered = engine
+            .search_filtered(
+                &query,
+                |doc_id| fps.get(doc_id as usize).copied(),
+                |doc_id| doc_id != 0,
+            )
+            .unwrap();
+
+        assert!(
+            filtered.iter().all(|(d, _)| *d != 0),
+            "rejected doc 0 leaked into filtered results"
+        );
+        assert_eq!(
+            filtered.len(),
+            unfiltered.len() - 1,
+            "filtered result should drop exactly the one rejected doc"
+        );
+    }
+
+    #[test]
+    fn test_search_filtered_all_pass_matches_unfiltered() {
+        let smiles = ["CCO", "CCCO", "CCCCO", "c1ccccc1", "NCCO", "CCN(CC)CC"];
+        let (fps, index, skip, _tmp) = build_index_from_smiles(&smiles);
+        let engine = BmwEngine::new(&index, &skip);
+        let query_fp = compute_morgan_fp("CCO");
+        let query = SimilarityQuery::new(query_fp, 0.0, 100);
+
+        let unfiltered = engine
+            .search(&query, |doc_id| fps.get(doc_id as usize).copied())
+            .unwrap();
+        let filtered = engine
+            .search_filtered(
+                &query,
+                |doc_id| fps.get(doc_id as usize).copied(),
+                |_| true,
+            )
+            .unwrap();
+
+        assert_eq!(filtered, unfiltered, "always-true filter changed results");
     }
 
     #[test]

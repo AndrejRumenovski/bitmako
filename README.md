@@ -15,8 +15,13 @@ library — **1.36 billion compounds** — on a single workstation.
    per-block max-popcount metadata for Block-Max WAND pruning.
 3. **Builds a flat fingerprint store** — a memory-mappable file of every
    fingerprint, addressed directly by `doc_id`.
-4. **Searches** for the top-k most Tanimoto-similar compounds to a query SMILES,
-   using BMW dynamic pruning to avoid scanning the full corpus.
+4. **Builds a flat property store** — a memory-mappable file of MW, LogP, rotatable
+   bonds, heavy atoms, and ring count per compound, also addressed by `doc_id`.
+5. **Searches** for the top-k most Tanimoto-similar compounds to a query SMILES,
+   using BMW dynamic pruning to avoid scanning the full corpus. Property filters
+   (`--mw-max`, `--logp-max`) are evaluated inside the pivot loop via O(1) mmap
+   reads — before the fingerprint fetch — so the engine returns exactly top-k
+   filtered results with no over-fetch.
 
 ## Scale (this build)
 
@@ -26,6 +31,7 @@ library — **1.36 billion compounds** — on a single workstation.
 | Lance dataset | ~333 GB |
 | Inverted index | ~70 GB |
 | Flat fingerprint store | ~163 GB (128 bytes/compound) |
+| Flat property store | ~27 GB (20 bytes/compound) |
 | Ingest throughput | ~270k compounds/sec (single bzip2 stream) |
 
 ## Architecture
@@ -39,15 +45,17 @@ library — **1.36 billion compounds** — on a single workstation.
       ▼
  Arrow RecordBatches ──▶ Lance dataset  (compounds.lance)
       │
-      ├── build-index ─────▶ inverted index   (compounds.bitmako)
-      │        └── build-skip ──▶ skip index   (compounds.skip)
-      └── build-fp-store ──▶ flat fingerprints (compounds.fp)
-                                   │
- query SMILES ──▶ BMW engine ◀─────┘
-                     │  (streams active-bit posting lists block-at-a-time,
-                     │   WAND min-shared-bits pivoting, skip-index jumps)
+      ├── build-index ──────▶ inverted index    (compounds.bitmako)
+      │        └── build-skip ──▶ skip index    (compounds.skip)
+      ├── build-fp-store ───▶ flat fingerprints (compounds.fp)
+      └── build-prop-store ─▶ flat properties   (compounds.prop)
+                                   │                    │
+ query SMILES ──▶ BMW engine ◀─────┘                    │
+                     │  1. WAND pivot: min-shared-bits   │
+                     │  2. Property pre-screen ◀─────────┘ O(1) mmap
+                     │  3. Fingerprint fetch + exact Tanimoto
                      ▼
-              top-k (doc_id, Tanimoto)
+              top-k (doc_id, Tanimoto) — already filtered
 ```
 
 ### Fingerprints
@@ -81,8 +89,14 @@ document-at-a-time over the active-bit lists with two key properties:
    queries from OOM-ing (the naive "decode every active list" approach needs
    tens of GB and can exceed RAM).
 
-Surviving pivots fetch the fingerprint from the mmap'd flat store, compute exact
-Tanimoto, and update the top-k min-heap.
+For each surviving pivot, the engine optionally checks molecular properties from the
+mmap'd flat property store (O(1), 20 bytes) before fetching the fingerprint (128
+bytes). Compounds failing a property filter never reach the exact-Tanimoto step and
+never enter the heap — so `top_k` results come back already filtered and no
+over-fetch heuristic is needed.
+
+Surviving pivots then fetch the fingerprint from the mmap'd flat fingerprint store,
+compute exact Tanimoto, and update the top-k min-heap.
 
 The streaming cursor is verified against an exhaustive linear scan in the test
 suite (identical results across many queries × thresholds).
@@ -106,20 +120,29 @@ bitmako build-index   --lance compounds.lance   --output compounds.bitmako --bit
 bitmako build-skip    --index compounds.bitmako --output compounds.skip
 
 # 4. Build the flat fingerprint store
-bitmako build-fp-store --lance compounds.lance  --output compounds.fp
+bitmako build-fp-store   --lance compounds.lance  --output compounds.fp
 
-# 5. Search (doc_id + Tanimoto only)
+# 5. Build the flat property store (~27 GB, one Lance scan)
+bitmako build-prop-store --lance compounds.lance  --output compounds.prop
+
+# 6. Search (doc_id + Tanimoto only)
 bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
     --query "OC(=O)c1ccccc1" --threshold 0.3 --top-k 10
 
-# 5b. Search with SMILES / property lookup (add --lance)
+# 6b. Search with SMILES / property lookup (add --lance)
 bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
     --lance compounds.lance \
     --query "OC(=O)c1ccccc1" --threshold 0.3 --top-k 10
 
-# 5c. Search with property filters (requires --lance)
+# 6c. Search with property filters — fast path (in-loop, no over-fetch)
 bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
-    --lance compounds.lance \
+    --prop-store compounds.prop \
+    --query "OC(=O)c1ccccc1" --threshold 0.1 --top-k 10 \
+    --mw-max 350 --logp-max 3
+
+# 6d. Search with property filters + SMILES output (combine --prop-store and --lance)
+bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --prop-store compounds.prop --lance compounds.lance \
     --query "OC(=O)c1ccccc1" --threshold 0.1 --top-k 10 \
     --mw-max 350 --logp-max 3
 ```
@@ -162,6 +185,12 @@ for the 70 GB index; ~6 GB output) — no rebuild required.
 **Fingerprint store (`*.fp`):** flat array of `num_compounds × [u64; 16]`, little
 -endian, indexed directly by `doc_id`. Memory-mapped at search time.
 
+**Property store (`*.prop`):** flat array of `num_compounds × 5 × f32` (mw, logp,
+rot_bonds, heavy_atoms, ring_count), 20 bytes per compound, little-endian, indexed
+directly by `doc_id`. Memory-mapped at search time. Integer-valued fields (rot_bonds
+etc.) are stored as f32 for uniform layout; all values round-trip exactly. At 1.36B
+compounds the file is ~27 GB.
+
 ## Search performance
 
 Measured on the full 1.36B-compound build, single workstation (32 GB RAM, cold
@@ -179,19 +208,17 @@ dominated by cold random fingerprint fetches from the 163 GB flat store (one dis
 seek per surviving candidate); these benefit directly from page-cache warmth, an
 SSD, or more RAM.
 
-## Known limitations / next steps
+## Known limitations
 
 - **Cold fingerprint fetches dominate large candidate sets.** Each pivot that
-  survives the count-based upper bound triggers a random 128-byte read from the flat
-  store. For low thresholds / small queries this is the main cost; a fingerprint
-  cache or property pre-filter would cut it.
-- **Property filters with `--lance` over-fetch 20×.** When `--mw-max` / `--logp-max`
-  are combined with a high `--top-k`, WAND fetches `top_k × 20` candidates and
-  post-filters via Lance. If the filter is very restrictive you may get fewer than
-  `top_k` results; increase `--top-k` to compensate.
-- **WAND is slow at 0 results.** At high thresholds with no matches the dynamic
-  threshold never rises, so pruning stays weak. Small queries (aspirin-sized) at
-  threshold ≥ 0.9 can take ~40 s.
+  survives the count-based upper bound triggers a random 128-byte read from the 163 GB
+  flat store. For low thresholds or common-fragment queries this is the main cost;
+  it benefits directly from page-cache warmth, an SSD, or more RAM.
+- **Property filters without `--prop-store` over-fetch 20×.** Passing `--mw-max` /
+  `--logp-max` with `--lance` but no `--prop-store` falls back to a post-filter pass:
+  WAND fetches `top_k × 20` candidates and drops non-matches. With very restrictive
+  filters you may receive fewer than `top_k` results; increase `--top-k` to
+  compensate, or build `compounds.prop` to use the fast in-loop path.
 
 ## Testing
 

@@ -4,9 +4,10 @@
 //!   bitmako ingest         --input <file.bz2> --output <dataset.lance>
 //!   bitmako build-index    --lance <dataset.lance> --output <index.bitmako>
 //!   bitmako build-skip     --index <index.bitmako> --output <index.skip>
-//!   bitmako build-fp-store --lance <dataset.lance> --output <store.fp>
+//!   bitmako build-fp-store   --lance <dataset.lance> --output <store.fp>
+//!   bitmako build-prop-store --lance <dataset.lance> --output <store.prop>
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> [--lance <dataset.lance>] --threshold 0.7 --top-k 100
-//!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> --mw-max 500 --logp-max 5
+//!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --prop-store <store.prop> --query <SMILES> --mw-max 500 --logp-max 5
 
 use std::path::PathBuf;
 use std::process;
@@ -48,11 +49,12 @@ fn main() {
         "build-index" => cmd_build_index(&args[2..]),
         "build-skip" => cmd_build_skip(&args[2..]),
         "build-fp-store" => cmd_build_fp_store(&args[2..]),
+        "build-prop-store" => cmd_build_prop_store(&args[2..]),
         "search" => cmd_search(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|search|verify> [options]");
+            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|verify> [options]");
             process::exit(1);
         }
     };
@@ -399,15 +401,107 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `build-prop-store --lance <dataset.lance> --output <store.prop>`
+///
+/// Writes molecular properties (mw, logp, rot_bonds, heavy_atoms, ring_count) for
+/// every compound to a flat binary file in Lance scan order — the same order as
+/// `build-index` and `build-fp-store`, so doc_ids line up. Each record is five
+/// little-endian f32 values (20 bytes); at 1.4B compounds the output is ~27 GB.
+///
+/// Memory-mapped at search time, this lets BMW screen property filters in O(1)
+/// inside the pivot loop before paying for the fingerprint fetch — replacing the
+/// Lance `Dataset::take` post-filter pass and its 20× over-fetch heuristic.
+fn cmd_build_prop_store(args: &[String]) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    use std::fs::File;
+    use arrow_array::{Array, cast::AsArray};
+    use arrow_array::types::{Float32Type, UInt32Type};
+    use bitmako::search::prop_store::PROP_BYTES;
+
+    let lance_path_str = require_flag(args, "--lance");
+    let output = PathBuf::from(require_flag(args, "--output"));
+
+    info!("Building flat property store: {} → {:?}", lance_path_str, output);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(bitmako::error::BitMakoError::Io)?;
+
+    let file = File::create(&output)?;
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
+    let mut count: u64 = 0;
+
+    rt.block_on(async {
+        use lance::dataset::Dataset;
+        use futures::TryStreamExt;
+
+        let dataset = Dataset::open(&lance_path_str)
+            .await
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+        let mut stream = dataset
+            .scan()
+            .project(&["mw", "logp", "rot_bonds", "heavy_atoms", "ring_count"])
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .try_into_stream()
+            .await
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+        {
+            let col = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild(format!("missing {}", name)))
+            };
+            let mw_col    = col("mw")?.as_primitive::<Float32Type>();
+            let logp_col  = col("logp")?.as_primitive::<Float32Type>();
+            let rot_col   = col("rot_bonds")?.as_primitive::<UInt32Type>();
+            let heavy_col = col("heavy_atoms")?.as_primitive::<UInt32Type>();
+            let ring_col  = col("ring_count")?.as_primitive::<UInt32Type>();
+
+            for row in 0..mw_col.len() {
+                let mut buf = [0u8; PROP_BYTES];
+                buf[0..4].copy_from_slice(&mw_col.value(row).to_le_bytes());
+                buf[4..8].copy_from_slice(&logp_col.value(row).to_le_bytes());
+                buf[8..12].copy_from_slice(&(rot_col.value(row) as f32).to_le_bytes());
+                buf[12..16].copy_from_slice(&(heavy_col.value(row) as f32).to_le_bytes());
+                buf[16..20].copy_from_slice(&(ring_col.value(row) as f32).to_le_bytes());
+                writer.write_all(&buf).map_err(bitmako::error::BitMakoError::Io)?;
+                count += 1;
+
+                if count % 100_000_000 == 0 {
+                    info!("Wrote {} million property records", count / 1_000_000);
+                }
+            }
+        }
+        Ok::<(), bitmako::error::BitMakoError>(())
+    })?;
+
+    writer.flush().map_err(bitmako::error::BitMakoError::Io)?;
+    info!(
+        "Property store written: {} records ({} MB)",
+        count,
+        count * (PROP_BYTES as u64) / (1024 * 1024)
+    );
+    Ok(())
+}
+
 /// `search --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES>`
 /// Optional: `--lance <dataset.lance>` `--threshold 0.7` `--top-k 50` `--mw-max 500` `--logp-max 5`
 ///
-/// Without `--lance`, prints doc_id + Tanimoto score only (property filters not available).
+/// Without `--lance`, prints doc_id + Tanimoto score only.
 /// With `--lance`, resolves each doc_id to compound_id, SMILES, and molecular properties
 /// via `Dataset::take` (random-access row lookup — no full scan).
 ///
-/// Property filters (`--mw-max`, `--logp-max`) require `--lance`. WAND over-fetches 20×
-/// so the post-filter pass has enough candidates to fill top_k after dropping non-matches.
+/// Property filters (`--mw-max`, `--logp-max`) need a property source:
+///   - `--prop-store <store.prop>` (preferred): screened in O(1) inside the WAND loop,
+///     no over-fetch, no Lance dependency at search time.
+///   - `--lance <dataset.lance>` (fallback): WAND over-fetches 20× and a post-filter pass
+///     drops non-matching candidates until top_k pass through.
 fn cmd_search(args: &[String]) -> Result<()> {
     let index_path = PathBuf::from(require_flag(args, "--index"));
     let skip_path = PathBuf::from(require_flag(args, "--skip"));
@@ -422,6 +516,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let mw_max: Option<f32> = flag_value(args, "--mw-max").and_then(|s| s.parse().ok());
     let logp_max: Option<f32> = flag_value(args, "--logp-max").and_then(|s| s.parse().ok());
     let lance_path: Option<String> = flag_value(args, "--lance");
+    let prop_store_path: Option<String> = flag_value(args, "--prop-store");
 
     let index = IndexReader::open(&index_path)?;
     info!("Loaded index: {} compounds", index.num_compounds);
@@ -465,21 +560,37 @@ fn cmd_search(args: &[String]) -> Result<()> {
 
     let has_filters = !query.property_filters.is_empty();
 
-    if has_filters && lance_path.is_none() {
-        eprintln!("error: --lance <dataset.lance> is required when --mw-max or --logp-max are specified");
+    // Two ways to satisfy property filters:
+    //   --prop-store : screen inside the WAND pivot loop (fast path, no over-fetch).
+    //   --lance      : legacy post-filter pass over WAND output; needs 20× over-fetch.
+    // Prefer the prop store when both are supplied.
+    let use_prop_store = has_filters && prop_store_path.is_some();
+    let use_lance_filter = has_filters && !use_prop_store;
+
+    if has_filters && prop_store_path.is_none() && lance_path.is_none() {
+        eprintln!(
+            "error: --mw-max/--logp-max require either --prop-store <store.prop> (fast) \
+             or --lance <dataset.lance> (post-filter)"
+        );
         process::exit(1);
     }
 
-    // Over-fetch from WAND when property filters are active so the Lance post-filter
-    // pass has enough candidates to fill top_k after dropping non-matching compounds.
+    // Only the legacy Lance post-filter path needs to over-fetch; the prop-store
+    // path filters inside the loop and returns exactly top_k matching results.
     let mut search_query = query.clone();
-    if has_filters {
+    if use_lance_filter {
         search_query.top_k = top_k.saturating_mul(20);
     }
 
     let skip = bitmako::index::skip::SkipIndex::open(&skip_path)?;
     let fp_store = bitmako::search::fp_store::FpStore::open(&fp_store_path)?;
-    let searcher = Searcher::open_from_index(index, skip, fp_store);
+    let mut searcher = Searcher::open_from_index(index, skip, fp_store);
+    if use_prop_store {
+        let prop_store = bitmako::search::prop_store::PropStore::open(
+            std::path::Path::new(prop_store_path.as_ref().unwrap()),
+        )?;
+        searcher = searcher.with_prop_store(prop_store);
+    }
     let results = searcher.search(&search_query)?;
 
     println!("Found {} candidates above threshold {}", results.len(), threshold);
@@ -534,7 +645,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
                     heavy_atoms: heavy_col.value(i),
                     ring_count:  ring_col.value(i),
                 };
-                if has_filters && !query.filter_passes(&props) {
+                if use_lance_filter && !query.filter_passes(&props) {
                     continue;
                 }
                 shown += 1;
@@ -555,7 +666,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
                 }
             }
 
-            if has_filters {
+            if use_lance_filter {
                 println!("({} of {} WAND candidates passed property filter)", shown, results.len());
             }
 

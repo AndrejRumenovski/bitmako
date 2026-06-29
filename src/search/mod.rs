@@ -1,6 +1,7 @@
 //! Similarity and property search engine.
 
 pub mod fp_store;
+pub mod prop_store;
 pub mod query;
 pub mod tanimoto;
 pub mod wand;
@@ -14,6 +15,7 @@ use crate::etl::fingerprint::compute_morgan_fp;
 use crate::index::skip::SkipIndex;
 use crate::index::IndexReader;
 use crate::search::fp_store::FpStore;
+use crate::search::prop_store::PropStore;
 use crate::search::query::SimilarityQuery;
 use crate::search::wand::BmwEngine;
 
@@ -28,6 +30,10 @@ pub struct Searcher {
     skip: SkipIndex,
     /// Memory-mapped flat fingerprint store for O(1) access by doc_id
     fp_store: FpStore,
+    /// Optional memory-mapped flat property store. When present and the query
+    /// carries property filters, BMW screens properties inside the pivot loop —
+    /// before paying for the fingerprint fetch — so no over-fetch is needed.
+    prop_store: Option<PropStore>,
 }
 
 impl Searcher {
@@ -41,7 +47,7 @@ impl Searcher {
             index.num_compounds,
             fp_store.len()
         );
-        Ok(Searcher { index, skip, fp_store })
+        Ok(Searcher { index, skip, fp_store, prop_store: None })
     }
 
     /// Construct a Searcher from already-loaded components.
@@ -51,13 +57,38 @@ impl Searcher {
             index.num_compounds,
             fp_store.len()
         );
-        Searcher { index, skip, fp_store }
+        Searcher { index, skip, fp_store, prop_store: None }
+    }
+
+    /// Attach a flat property store, enabling in-loop property pre-filtering.
+    pub fn with_prop_store(mut self, prop_store: PropStore) -> Self {
+        info!("Property store attached: {} records", prop_store.len());
+        self.prop_store = Some(prop_store);
+        self
     }
 
     /// Execute a similarity search returning top-k results.
+    ///
+    /// When a property store is attached and the query carries property filters,
+    /// the filter is evaluated inside the BMW pivot loop as a cheap pre-screen, so
+    /// only compounds satisfying both the Tanimoto threshold *and* the property
+    /// filters reach the heap — `top_k` results come back already filtered, with
+    /// no over-fetch.
     pub fn search(&self, query: &SimilarityQuery) -> Result<Vec<(u32, f32)>> {
         let engine = BmwEngine::new(&self.index, &self.skip);
-        let results = engine.search(query, |doc_id| self.fp_store.get(doc_id))?;
+        let results = match &self.prop_store {
+            Some(prop_store) if !query.property_filters.is_empty() => engine.search_filtered(
+                query,
+                |doc_id| self.fp_store.get(doc_id),
+                |doc_id| {
+                    prop_store
+                        .get(doc_id)
+                        .map(|props| query.filter_passes(&props))
+                        .unwrap_or(false)
+                },
+            )?,
+            _ => engine.search(query, |doc_id| self.fp_store.get(doc_id))?,
+        };
         Ok(results)
     }
 
