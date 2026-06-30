@@ -21,6 +21,7 @@ use bitmako::etl::fingerprint::{compute_morgan_fp, fp_popcount};
 use bitmako::etl::reader::ReaderConfig;
 use bitmako::index::IndexReader;
 use bitmako::search::query::{PropertyField, PropertyFilter, SimilarityQuery};
+use bitmako::search::wand::SearchStats;
 use bitmako::search::Searcher;
 
 fn init_tracing() {
@@ -51,10 +52,11 @@ fn main() {
         "build-fp-store" => cmd_build_fp_store(&args[2..]),
         "build-prop-store" => cmd_build_prop_store(&args[2..]),
         "search" => cmd_search(&args[2..]),
+        "bench-linear" => cmd_bench_linear(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|verify> [options]");
+            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|bench-linear|verify> [options]");
             process::exit(1);
         }
     };
@@ -517,6 +519,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let logp_max: Option<f32> = flag_value(args, "--logp-max").and_then(|s| s.parse().ok());
     let lance_path: Option<String> = flag_value(args, "--lance");
     let prop_store_path: Option<String> = flag_value(args, "--prop-store");
+    let print_stats = args.iter().any(|a| a == "--stats");
 
     let index = IndexReader::open(&index_path)?;
     info!("Loaded index: {} compounds", index.num_compounds);
@@ -591,9 +594,17 @@ fn cmd_search(args: &[String]) -> Result<()> {
         )?;
         searcher = searcher.with_prop_store(prop_store);
     }
-    let results = searcher.search(&search_query)?;
+    let (results, stats) = searcher.search_with_stats(&search_query)?;
 
     println!("Found {} candidates above threshold {}", results.len(), threshold);
+    if print_stats {
+        println!(
+            "WAND stats: evaluated={} ({:.4}% of corpus) pivots_skipped={}",
+            stats.docs_evaluated,
+            stats.eval_fraction() * 100.0,
+            stats.pivots_skipped,
+        );
+    }
 
     if results.is_empty() {
         return Ok(());
@@ -756,6 +767,74 @@ fn cmd_verify(args: &[String]) -> Result<()> {
             mismatches
         )))
     }
+}
+
+/// `bench-linear --fp-store <store.fp> --query <SMILES> --threshold T [--sample N] [--top-k K]`
+///
+/// Baseline linear scan over the flat fingerprint store — evaluates every compound
+/// sequentially, computing exact Tanimoto for each. Used to measure the speedup
+/// that WAND achieves over a naive exhaustive search.
+///
+/// `--sample N` limits the scan to the first N fingerprints and extrapolates timing
+/// to the full corpus, so you don't need to wait for a full 1.36B-compound scan.
+fn cmd_bench_linear(args: &[String]) -> Result<()> {
+    use std::time::Instant;
+    use bitmako::search::fp_store::FpStore;
+    use bitmako::search::tanimoto::tanimoto;
+    use bitmako::etl::fingerprint::fp_popcount;
+
+    let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
+    let query_smiles = require_flag(args, "--query");
+    let threshold: f32 = flag_value(args, "--threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.7);
+    let top_k: usize = flag_value(args, "--top-k")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let sample: Option<usize> = flag_value(args, "--sample").and_then(|s| s.parse().ok());
+
+    let fp_store = FpStore::open(&fp_store_path)?;
+    let total = fp_store.len();
+    let limit = sample.unwrap_or(total).min(total);
+
+    let query_fp = compute_morgan_fp(&query_smiles);
+    let query_pop = fp_popcount(&query_fp);
+
+    println!("Linear scan: query_pop={} threshold={} sample={}/{}", query_pop, threshold, limit, total);
+
+    let t0 = Instant::now();
+    let mut hits: Vec<(u32, f32)> = Vec::new();
+
+    for doc_id in 0..limit as u32 {
+        if let Some(fp) = fp_store.get(doc_id) {
+            let score = tanimoto(&query_fp, &fp);
+            if score >= threshold {
+                hits.push((doc_id, score));
+            }
+        }
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    hits.truncate(top_k);
+
+    println!("Scanned {} compounds in {:.2}s ({:.0} compounds/sec)", limit, elapsed, limit as f64 / elapsed);
+    println!("Hits in sample: {}", hits.len());
+
+    if sample.is_some() && limit < total {
+        let extrapolated = elapsed * (total as f64 / limit as f64);
+        println!(
+            "Extrapolated full-corpus time: {:.0}s ({:.0} min)",
+            extrapolated,
+            extrapolated / 60.0
+        );
+    }
+
+    for (rank, (doc_id, score)) in hits.iter().enumerate().take(5) {
+        println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
+    }
+
+    Ok(())
 }
 
 fn require_flag(args: &[String], flag: &str) -> String {

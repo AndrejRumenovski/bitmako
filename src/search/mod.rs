@@ -17,7 +17,7 @@ use crate::index::IndexReader;
 use crate::search::fp_store::FpStore;
 use crate::search::prop_store::PropStore;
 use crate::search::query::SimilarityQuery;
-use crate::search::wand::BmwEngine;
+use crate::search::wand::{BmwEngine, SearchStats};
 
 /// High-level search interface backed by the BMW engine and a flat fingerprint store.
 ///
@@ -90,6 +90,24 @@ impl Searcher {
             _ => engine.search(query, |doc_id| self.fp_store.get(doc_id))?,
         };
         Ok(results)
+    }
+
+    /// Like [`search`] but also returns pruning diagnostics.
+    pub fn search_with_stats(&self, query: &SimilarityQuery) -> Result<(Vec<(u32, f32)>, SearchStats)> {
+        let engine = BmwEngine::new(&self.index, &self.skip);
+        match &self.prop_store {
+            Some(prop_store) if !query.property_filters.is_empty() => engine.search_filtered_with_stats(
+                query,
+                |doc_id| self.fp_store.get(doc_id),
+                |doc_id| {
+                    prop_store
+                        .get(doc_id)
+                        .map(|props| query.filter_passes(&props))
+                        .unwrap_or(false)
+                },
+            ),
+            _ => engine.search_with_stats(query, |doc_id| self.fp_store.get(doc_id)),
+        }
     }
 
     /// Convenience: search by SMILES string instead of pre-computed fingerprint.

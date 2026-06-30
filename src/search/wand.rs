@@ -27,6 +27,28 @@ use crate::index::skip::{SkipIndex, SkipSlice};
 use crate::search::query::{SimilarityQuery, validate_query};
 use crate::search::tanimoto::tanimoto_with_threshold;
 
+/// Diagnostic counters returned by the WAND engine alongside search results.
+#[derive(Debug, Clone, Default)]
+pub struct SearchStats {
+    /// Number of documents for which exact Tanimoto was computed.
+    pub docs_evaluated: u64,
+    /// Number of pivot candidates skipped by WAND pruning (upper-bound too low,
+    /// or alignment miss).
+    pub pivots_skipped: u64,
+    /// Total documents in the corpus (denominator for pruning rate).
+    pub corpus_size: u64,
+}
+
+impl SearchStats {
+    /// Fraction of the corpus that reached exact Tanimoto evaluation (0.0–1.0).
+    pub fn eval_fraction(&self) -> f64 {
+        if self.corpus_size == 0 {
+            return 0.0;
+        }
+        self.docs_evaluated as f64 / self.corpus_size as f64
+    }
+}
+
 /// Scored candidate in the top-k min-heap.
 /// BinaryHeap is a max-heap; we reverse comparison to make it a min-heap
 /// so we efficiently evict the lowest-scoring element when heap overflows top_k.
@@ -182,6 +204,16 @@ impl<'a> BmwEngine<'a> {
         query: &SimilarityQuery,
         get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
     ) -> Result<Vec<(u32, f32)>> {
+        Ok(self.search_inner(query, get_fingerprint, |_| true)?.0)
+    }
+
+    /// Like [`search`](Self::search) but also returns [`SearchStats`] with pruning
+    /// diagnostics (docs evaluated, pivots skipped, corpus size).
+    pub fn search_with_stats(
+        &self,
+        query: &SimilarityQuery,
+        get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
+    ) -> Result<(Vec<(u32, f32)>, SearchStats)> {
         self.search_inner(query, get_fingerprint, |_| true)
     }
 
@@ -197,6 +229,17 @@ impl<'a> BmwEngine<'a> {
         get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
         passes_filter: impl Fn(u32) -> bool,
     ) -> Result<Vec<(u32, f32)>> {
+        Ok(self.search_inner(query, get_fingerprint, passes_filter)?.0)
+    }
+
+    /// Like [`search_filtered`](Self::search_filtered) but also returns
+    /// [`SearchStats`].
+    pub fn search_filtered_with_stats(
+        &self,
+        query: &SimilarityQuery,
+        get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
+        passes_filter: impl Fn(u32) -> bool,
+    ) -> Result<(Vec<(u32, f32)>, SearchStats)> {
         self.search_inner(query, get_fingerprint, passes_filter)
     }
 
@@ -205,12 +248,12 @@ impl<'a> BmwEngine<'a> {
         query: &SimilarityQuery,
         get_fingerprint: impl Fn(u32) -> Option<Fingerprint>,
         passes_filter: impl Fn(u32) -> bool,
-    ) -> Result<Vec<(u32, f32)>> {
+    ) -> Result<(Vec<(u32, f32)>, SearchStats)> {
         validate_query(query)?;
 
         let active_bits = query.active_bits();
         if active_bits.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SearchStats::default()));
         }
 
         // Open a streaming cursor over each active-bit posting list. Each decodes
@@ -233,7 +276,7 @@ impl<'a> BmwEngine<'a> {
             .collect();
 
         if cursors.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), SearchStats::default()));
         }
 
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(query.top_k + 1);
@@ -347,6 +390,12 @@ impl<'a> BmwEngine<'a> {
             docs_evaluated, pivots_skipped, heap.len()
         );
 
+        let stats = SearchStats {
+            docs_evaluated,
+            pivots_skipped,
+            corpus_size: self.index.num_compounds as u64,
+        };
+
         // `into_sorted_vec` on our min-heap (reversed Ord) yields elements in
         // ascending order of reversed-Ord == descending order of actual score.
         let results: Vec<(u32, f32)> = heap
@@ -355,7 +404,7 @@ impl<'a> BmwEngine<'a> {
             .map(|c| (c.doc_id, c.score.0))
             .collect();
 
-        Ok(results)
+        Ok((results, stats))
     }
 }
 

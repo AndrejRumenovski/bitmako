@@ -234,6 +234,11 @@ qualifying results:
   filters you may receive fewer than `top_k` results; increase `--top-k` to
   compensate, or build `compounds.prop` to use the fast in-loop path.
 
+## Benchmarks
+
+Full benchmark results — pruning rates, speedup vs. linear scan, property-filter
+comparison — are in [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Testing
 
 ```bash
