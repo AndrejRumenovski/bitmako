@@ -208,6 +208,20 @@ dominated by cold random fingerprint fetches from the 163 GB flat store (one dis
 seek per surviving candidate); these benefit directly from page-cache warmth, an
 SSD, or more RAM.
 
+### Property-filtered search
+
+When `--prop-store` is supplied, molecular properties are screened in O(1) inside
+the WAND pivot loop — before the fingerprint fetch — so rejected compounds never
+reach the exact-Tanimoto step and the dynamic threshold rises faster on genuinely
+qualifying results:
+
+| Query | Mode | Time |
+|---|---|---|
+| Benzoic acid @ 0.2, mw≤350, logp≤3, top-10 | `--prop-store` (in-loop) | **8 s** |
+| Benzoic acid @ 0.2, mw≤350, logp≤3, top-10 | `--lance` post-filter (20× over-fetch) | 30 s |
+
+3.7× faster than the Lance post-filter path for the same results.
+
 ## Known limitations
 
 - **Cold fingerprint fetches dominate large candidate sets.** Each pivot that
