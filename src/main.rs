@@ -8,6 +8,7 @@
 //!   bitmako build-prop-store --lance <dataset.lance> --output <store.prop>
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> [--lance <dataset.lance>] --threshold 0.7 --top-k 100
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --prop-store <store.prop> --query <SMILES> --mw-max 500 --logp-max 5
+//!   bitmako search-batch   --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --queries <queries.smi> --threshold 0.7 --top-k 50 [--output results.tsv]
 
 use std::path::PathBuf;
 use std::process;
@@ -52,11 +53,12 @@ fn main() {
         "build-fp-store" => cmd_build_fp_store(&args[2..]),
         "build-prop-store" => cmd_build_prop_store(&args[2..]),
         "search" => cmd_search(&args[2..]),
+        "search-batch" => cmd_search_batch(&args[2..]),
         "bench-linear" => cmd_bench_linear(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|bench-linear|verify> [options]");
+            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|search-batch|bench-linear|verify> [options]");
             process::exit(1);
         }
     };
@@ -687,6 +689,330 @@ fn cmd_search(args: &[String]) -> Result<()> {
         for (rank, (doc_id, score)) in results.iter().enumerate() {
             println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
         }
+    }
+
+    Ok(())
+}
+
+/// One query line parsed from a `--queries` file: `SMILES [ID]` per line,
+/// blank lines and `#`-comments skipped. Missing IDs default to `Q<line>`.
+struct BatchQueryInput {
+    id: String,
+    smiles: String,
+}
+
+/// Outcome of running one query from the batch through the shared `Searcher`.
+/// Per-query failures (e.g. unparseable SMILES) are captured in `error` rather
+/// than aborting the whole batch.
+struct BatchQueryOutcome {
+    id: String,
+    smiles: String,
+    results: Vec<(u32, f32)>,
+    stats: SearchStats,
+    error: Option<String>,
+}
+
+fn parse_queries_file(path: &std::path::Path) -> Result<Vec<BatchQueryInput>> {
+    let content = std::fs::read_to_string(path)?;
+    let mut queries = Vec::new();
+    for (lineno, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let smiles = parts.next().unwrap().to_string();
+        let id = parts
+            .next()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Q{}", lineno + 1));
+        queries.push(BatchQueryInput { id, smiles });
+    }
+    Ok(queries)
+}
+
+fn run_one_query(
+    searcher: &Searcher,
+    q: &BatchQueryInput,
+    threshold: f32,
+    top_k: usize,
+    mw_max: Option<f32>,
+    logp_max: Option<f32>,
+) -> BatchQueryOutcome {
+    let query_fp = compute_morgan_fp(&q.smiles);
+    let mut query = SimilarityQuery::new(query_fp, threshold, top_k);
+    if let Some(max) = mw_max {
+        query = query.with_filter(PropertyFilter { field: PropertyField::MolWeight, min: None, max: Some(max) });
+    }
+    if let Some(max) = logp_max {
+        query = query.with_filter(PropertyFilter { field: PropertyField::LogP, min: None, max: Some(max) });
+    }
+
+    match searcher.search_with_stats(&query) {
+        Ok((results, stats)) => BatchQueryOutcome {
+            id: q.id.clone(),
+            smiles: q.smiles.clone(),
+            results,
+            stats,
+            error: None,
+        },
+        Err(e) => BatchQueryOutcome {
+            id: q.id.clone(),
+            smiles: q.smiles.clone(),
+            results: Vec::new(),
+            stats: SearchStats::default(),
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+fn print_plain_results(batch: &[BatchQueryOutcome], print_stats: bool) {
+    for q in batch {
+        if let Some(err) = &q.error {
+            println!("=== {} ({}) === ERROR: {}", q.id, q.smiles, err);
+            continue;
+        }
+        println!("=== {} ({}) === {} results", q.id, q.smiles, q.results.len());
+        if print_stats {
+            println!(
+                "  stats: evaluated={} ({:.4}% of corpus) pivots_skipped={}",
+                q.stats.docs_evaluated,
+                q.stats.eval_fraction() * 100.0,
+                q.stats.pivots_skipped,
+            );
+        }
+        for (rank, (doc_id, score)) in q.results.iter().enumerate() {
+            println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
+        }
+    }
+}
+
+fn write_plain_tsv(batch: &[BatchQueryOutcome], out_path: &str) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out_path)?);
+    writeln!(f, "query_id\tquery_smiles\trank\tdoc_id\tscore\tdocs_evaluated\teval_fraction_pct\terror")?;
+    for q in batch {
+        let err = q.error.as_deref().unwrap_or("");
+        if q.results.is_empty() {
+            writeln!(
+                f, "{}\t{}\t\t\t\t{}\t{:.6}\t{}",
+                q.id, q.smiles, q.stats.docs_evaluated, q.stats.eval_fraction() * 100.0, err
+            )?;
+            continue;
+        }
+        for (rank, (doc_id, score)) in q.results.iter().enumerate() {
+            writeln!(
+                f, "{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.6}\t{}",
+                q.id, q.smiles, rank + 1, doc_id, score,
+                q.stats.docs_evaluated, q.stats.eval_fraction() * 100.0, err
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolves SMILES + properties for every result via `Dataset::take` (one call
+/// per query, in doc_id order matching `q.results`) and writes either to stdout
+/// (human-readable) or, with `output_path`, to a TSV file.
+fn resolve_and_write_lance(
+    batch: &[BatchQueryOutcome],
+    lance_str: &str,
+    output_path: Option<&str>,
+    print_stats: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(bitmako::error::BitMakoError::Io)?;
+
+    rt.block_on(async {
+        use lance::dataset::Dataset;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Float32Type, UInt32Type};
+
+        let dataset = Dataset::open(lance_str)
+            .await
+            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+
+        let mut writer: Box<dyn Write> = match output_path {
+            Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
+            None => Box::new(std::io::stdout()),
+        };
+        if output_path.is_some() {
+            writeln!(
+                writer,
+                "query_id\tquery_smiles\trank\tdoc_id\tscore\tcompound_id\tcompound_smiles\tmw\tlogp\trot_bonds\theavy_atoms\tring_count\tdocs_evaluated\teval_fraction_pct\terror"
+            ).map_err(bitmako::error::BitMakoError::Io)?;
+        }
+
+        for q in batch {
+            if let Some(err) = &q.error {
+                if output_path.is_some() {
+                    writeln!(writer, "{}\t{}\t\t\t\t\t\t\t\t\t\t\t\t\t{}", q.id, q.smiles, err)
+                        .map_err(bitmako::error::BitMakoError::Io)?;
+                } else {
+                    println!("=== {} ({}) === ERROR: {}", q.id, q.smiles, err);
+                }
+                continue;
+            }
+
+            if output_path.is_none() {
+                println!("=== {} ({}) === {} results", q.id, q.smiles, q.results.len());
+                if print_stats {
+                    println!(
+                        "  stats: evaluated={} ({:.4}% of corpus) pivots_skipped={}",
+                        q.stats.docs_evaluated,
+                        q.stats.eval_fraction() * 100.0,
+                        q.stats.pivots_skipped,
+                    );
+                }
+            }
+
+            if q.results.is_empty() {
+                if output_path.is_some() {
+                    writeln!(
+                        writer, "{}\t{}\t\t\t\t\t\t\t\t\t\t\t{}\t{:.6}\t",
+                        q.id, q.smiles, q.stats.docs_evaluated, q.stats.eval_fraction() * 100.0
+                    ).map_err(bitmako::error::BitMakoError::Io)?;
+                }
+                continue;
+            }
+
+            let row_indices: Vec<u64> = q.results.iter().map(|(d, _)| *d as u64).collect();
+            let projection = dataset
+                .schema()
+                .project(&["compound_id", "smiles", "mw", "logp", "rot_bonds", "heavy_atoms", "ring_count"])
+                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            let batch_rows = dataset
+                .take(&row_indices, projection)
+                .await
+                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+
+            let cid_col   = batch_rows.column_by_name("compound_id").unwrap().as_string::<i32>();
+            let smi_col   = batch_rows.column_by_name("smiles").unwrap().as_string::<i32>();
+            let mw_col    = batch_rows.column_by_name("mw").unwrap().as_primitive::<Float32Type>();
+            let logp_col  = batch_rows.column_by_name("logp").unwrap().as_primitive::<Float32Type>();
+            let rot_col   = batch_rows.column_by_name("rot_bonds").unwrap().as_primitive::<UInt32Type>();
+            let heavy_col = batch_rows.column_by_name("heavy_atoms").unwrap().as_primitive::<UInt32Type>();
+            let ring_col  = batch_rows.column_by_name("ring_count").unwrap().as_primitive::<UInt32Type>();
+
+            for (i, (doc_id, score)) in q.results.iter().enumerate() {
+                if output_path.is_some() {
+                    writeln!(
+                        writer,
+                        "{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{:.1}\t{:.2}\t{}\t{}\t{}\t{}\t{:.6}\t",
+                        q.id, q.smiles, i + 1, doc_id, score,
+                        cid_col.value(i), smi_col.value(i),
+                        mw_col.value(i), logp_col.value(i), rot_col.value(i), heavy_col.value(i), ring_col.value(i),
+                        q.stats.docs_evaluated, q.stats.eval_fraction() * 100.0,
+                    ).map_err(bitmako::error::BitMakoError::Io)?;
+                } else {
+                    println!(
+                        "  #{}: compound={} score={:.4} smiles={} mw={:.1} logp={:.2} rot_bonds={} heavy_atoms={} rings={}",
+                        i + 1, cid_col.value(i), score, smi_col.value(i),
+                        mw_col.value(i), logp_col.value(i), rot_col.value(i), heavy_col.value(i), ring_col.value(i),
+                    );
+                }
+            }
+        }
+
+        Ok::<(), bitmako::error::BitMakoError>(())
+    })
+}
+
+/// `search-batch --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --queries <queries.smi>`
+/// Optional: `--prop-store <store.prop>` `--lance <dataset.lance>` `--threshold 0.7` `--top-k 50`
+///           `--mw-max 500` `--logp-max 5` `--stats` `--output <results.tsv>` `--threads N`
+///
+/// Reads one SMILES query per line from `--queries` (optional whitespace-separated
+/// ID as a second column; blank and `#`-comment lines are skipped), then runs every
+/// query against a single shared `Searcher` — sharing one set of mmap'd
+/// index/skip/fp-store/prop-store handles instead of re-opening them per query —
+/// in parallel across CPU cores via Rayon.
+///
+/// Property filters in batch mode require `--prop-store` (the in-loop fast path).
+/// The legacy `--lance` 20×-over-fetch path used by single-query `search` isn't
+/// supported here, to keep the parallel/batched result flow simple.
+fn cmd_search_batch(args: &[String]) -> Result<()> {
+    use rayon::prelude::*;
+
+    let index_path = PathBuf::from(require_flag(args, "--index"));
+    let skip_path = PathBuf::from(require_flag(args, "--skip"));
+    let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
+    let queries_path = PathBuf::from(require_flag(args, "--queries"));
+    let threshold: f32 = flag_value(args, "--threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.7);
+    let top_k: usize = flag_value(args, "--top-k")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let mw_max: Option<f32> = flag_value(args, "--mw-max").and_then(|s| s.parse().ok());
+    let logp_max: Option<f32> = flag_value(args, "--logp-max").and_then(|s| s.parse().ok());
+    let lance_path: Option<String> = flag_value(args, "--lance");
+    let prop_store_path: Option<String> = flag_value(args, "--prop-store");
+    let print_stats = args.iter().any(|a| a == "--stats");
+    let output_path: Option<String> = flag_value(args, "--output");
+    let threads: Option<usize> = flag_value(args, "--threads").and_then(|s| s.parse().ok());
+
+    if let Some(n) = threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .map_err(|e| bitmako::error::BitMakoError::Query(format!("failed to set thread pool size: {}", e)))?;
+    }
+
+    let has_filters = mw_max.is_some() || logp_max.is_some();
+    if has_filters && prop_store_path.is_none() {
+        eprintln!(
+            "error: --mw-max/--logp-max in search-batch require --prop-store <store.prop> \
+             (the legacy --lance over-fetch path isn't supported in batch mode)"
+        );
+        process::exit(1);
+    }
+
+    let queries = parse_queries_file(&queries_path)?;
+    if queries.is_empty() {
+        eprintln!("No queries found in {:?}", queries_path);
+        process::exit(1);
+    }
+    info!("Loaded {} queries from {:?}", queries.len(), queries_path);
+
+    let index = IndexReader::open(&index_path)?;
+    info!("Loaded index: {} compounds", index.num_compounds);
+    let skip = bitmako::index::skip::SkipIndex::open(&skip_path)?;
+    let fp_store = bitmako::search::fp_store::FpStore::open(&fp_store_path)?;
+    let mut searcher = Searcher::open_from_index(index, skip, fp_store);
+    if let Some(p) = &prop_store_path {
+        let prop_store = bitmako::search::prop_store::PropStore::open(std::path::Path::new(p))?;
+        searcher = searcher.with_prop_store(prop_store);
+    }
+
+    let t0 = std::time::Instant::now();
+    let batch_results: Vec<BatchQueryOutcome> = queries
+        .par_iter()
+        .map(|q| run_one_query(&searcher, q, threshold, top_k, mw_max, logp_max))
+        .collect();
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    let ok_count = batch_results.iter().filter(|r| r.error.is_none()).count();
+    let total_results: usize = batch_results.iter().map(|r| r.results.len()).sum();
+    info!(
+        "Batch search complete: {}/{} queries ok, {} total results, {:.2}s ({:.1} queries/sec)",
+        ok_count, queries.len(), total_results, elapsed, queries.len() as f64 / elapsed
+    );
+    println!(
+        "Processed {} queries in {:.2}s ({:.1} queries/sec) — {} ok, {} total results",
+        queries.len(), elapsed, queries.len() as f64 / elapsed, ok_count, total_results
+    );
+
+    if let Some(lance_str) = &lance_path {
+        resolve_and_write_lance(&batch_results, lance_str, output_path.as_deref(), print_stats)?;
+    } else if let Some(out_path) = &output_path {
+        write_plain_tsv(&batch_results, out_path)?;
+    } else {
+        print_plain_results(&batch_results, print_stats);
     }
 
     Ok(())

@@ -22,6 +22,9 @@ library — **1.36 billion compounds** — on a single workstation.
    (`--mw-max`, `--logp-max`) are evaluated inside the pivot loop via O(1) mmap
    reads — before the fingerprint fetch — so the engine returns exactly top-k
    filtered results with no over-fetch.
+6. **Batch-searches** a file of SMILES queries (`search-batch`) against one shared,
+   mmap'd `Searcher` in parallel across CPU cores (Rayon), writing results to
+   stdout or a TSV file.
 
 ## Scale (this build)
 
@@ -145,7 +148,33 @@ bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compou
     --prop-store compounds.prop --lance compounds.lance \
     --query "OC(=O)c1ccccc1" --threshold 0.1 --top-k 10 \
     --mw-max 350 --logp-max 3
+
+# 7. Batch search — one query per line of a .smi file ("SMILES [ID]"), run in
+#    parallel across CPU cores against a single shared Searcher
+bitmako search-batch --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --queries queries.smi --threshold 0.3 --top-k 20
+
+# 7b. Batch search with SMILES/property resolution and results written to a TSV file
+bitmako search-batch --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --lance compounds.lance --queries queries.smi --threshold 0.3 --top-k 20 \
+    --output results.tsv --stats
 ```
+
+### Batch query mode
+
+`search-batch` reads one SMILES query per line from a `.smi` file (blank lines and
+`#`-comments skipped; an optional second whitespace-separated column supplies a
+query ID, defaulting to `Q<line>`), then runs every query through **one** shared
+`Searcher` — reusing the same mmap'd index/skip/fp-store/prop-store handles instead
+of re-opening them per query — in parallel across CPU cores via Rayon.
+
+A query that fails (e.g. unparseable SMILES) is captured as a per-query error and
+does not abort the rest of the batch. Results print to stdout by default, or to a
+TSV file with `--output`. `--lance` resolves SMILES/properties per result via one
+`Dataset::take` call per query. Property filters (`--mw-max`/`--logp-max`) require
+`--prop-store` in batch mode — the legacy `--lance` 20×-over-fetch path isn't
+supported here, to keep the parallel/batched result flow simple. `--threads N`
+overrides Rayon's default thread pool size.
 
 > **Tanimoto is size-sensitive.** A small query (few set bits) can't reach a high
 > Tanimoto against the large building-block compounds in REAL — even full
