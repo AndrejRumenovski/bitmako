@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,14 @@ use crate::search::Searcher;
 struct AppState {
     searcher: Searcher,
     lance: Option<lance::dataset::Dataset>,
+}
+
+/// The single-page search UI, embedded at compile time so the server ships as
+/// one binary with no separate static-file deployment step.
+const INDEX_HTML: &str = include_str!("../static/index.html");
+
+async fn handle_index() -> Html<&'static str> {
+    Html(INDEX_HTML)
 }
 
 #[derive(Deserialize)]
@@ -223,6 +232,7 @@ pub async fn run_server(searcher: Searcher, lance_path: Option<String>, bind: &s
     let state = Arc::new(AppState { searcher, lance });
 
     let app = Router::new()
+        .route("/", get(handle_index))
         .route("/health", get(handle_health))
         .route("/search", post(handle_search))
         .with_state(state);
@@ -232,6 +242,7 @@ pub async fn run_server(searcher: Searcher, lance_path: Option<String>, bind: &s
         .await
         .map_err(BitMakoError::Io)?;
     info!("BitMako HTTP API listening on http://{}", addr);
+    info!("Search UI: http://{}/", addr);
     axum::serve(listener, app).await.map_err(BitMakoError::Io)?;
     Ok(())
 }
