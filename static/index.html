@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BitMako — similarity search</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #F4F7F6;
+    --panel:     #FFFFFF;
+    --ink:       #10181A;
+    --ink-muted: #55666B;
+    --teal:      #0E7C74;
+    --teal-dim:  #CFE6E3;
+    --amber:     #C2570E;
+    --rule:      #D7DEDD;
+    --error:     #B23A2E;
+    --error-bg:  #FBEAE7;
+
+    --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+    --sans: 'IBM Plex Sans', ui-sans-serif, system-ui, 'Segoe UI', Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  main {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 0 24px 96px;
+  }
+
+  /* ---------- masthead ---------- */
+
+  header.masthead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 40px 0 24px;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 40px;
+    flex-wrap: wrap;
+  }
+
+  .wordmark {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 22px;
+    letter-spacing: 0.02em;
+  }
+
+  .wordmark small {
+    display: block;
+    font-family: var(--sans);
+    font-weight: 400;
+    font-size: 13px;
+    color: var(--ink-muted);
+    letter-spacing: 0;
+    margin-top: 4px;
+  }
+
+  .corpus-count {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink-muted);
+    text-align: right;
+    white-space: nowrap;
+  }
+
+  .corpus-count strong {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  /* ---------- search form ---------- */
+
+  .eyebrow {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    display: block;
+    margin-bottom: 8px;
+  }
+
+  #smiles {
+    width: 100%;
+    font-family: var(--mono);
+    font-size: 20px;
+    padding: 8px 2px 12px;
+    border: none;
+    border-bottom: 2px solid var(--ink);
+    background: transparent;
+    color: var(--ink);
+    outline: none;
+  }
+
+  #smiles::placeholder { color: #A9B4B3; }
+  #smiles:focus { border-bottom-color: var(--teal); }
+
+  .params {
+    display: flex;
+    align-items: flex-end;
+    gap: 28px;
+    flex-wrap: wrap;
+    margin-top: 24px;
+  }
+
+  .param label { display: block; }
+
+  .param input {
+    font-family: var(--mono);
+    font-size: 15px;
+    width: 84px;
+    padding: 6px 8px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: var(--panel);
+    color: var(--ink);
+    outline: none;
+  }
+
+  .param input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px var(--teal-dim); }
+  .param input:disabled { color: #B7C0BF; background: #EEF1F0; }
+
+  #advanced-toggle {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--teal);
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 6px 0;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  #advanced-row {
+    display: none;
+    gap: 28px;
+    flex-wrap: wrap;
+    margin-top: 20px;
+  }
+  #advanced-row.open { display: flex; }
+
+  .prop-note {
+    font-size: 12px;
+    color: var(--ink-muted);
+    margin-top: 6px;
+    max-width: 320px;
+  }
+
+  button#search-btn {
+    margin-left: auto;
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 14px;
+    color: #fff;
+    background: var(--teal);
+    border: none;
+    border-radius: 3px;
+    padding: 11px 28px;
+    cursor: pointer;
+  }
+  button#search-btn:hover { background: #0B655F; }
+  button#search-btn:disabled { background: #9FB9B6; cursor: default; }
+  button#search-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  /* ---------- messages ---------- */
+
+  #error-box {
+    display: none;
+    margin-top: 28px;
+    padding: 14px 16px;
+    background: var(--error-bg);
+    border: 1px solid var(--error);
+    border-radius: 3px;
+    color: var(--error);
+    font-size: 14px;
+  }
+  #error-box.show { display: block; }
+
+  #empty-box {
+    display: none;
+    margin-top: 40px;
+    color: var(--ink-muted);
+    font-size: 15px;
+  }
+  #empty-box.show { display: block; }
+
+  /* ---------- hero readout ---------- */
+
+  #hero {
+    display: none;
+    text-align: center;
+    padding: 40px 0 36px;
+    border-bottom: 1px solid var(--rule);
+    margin-top: 40px;
+  }
+  #hero.show { display: block; }
+
+  #hero-count {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(32px, 7vw, 56px);
+    color: var(--amber);
+    line-height: 1;
+  }
+
+  #hero-caption {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--ink-muted);
+  }
+
+  #hero-caption .frac { font-family: var(--mono); color: var(--ink); }
+
+  /* ---------- results table ---------- */
+
+  #results-wrap { margin-top: 32px; overflow-x: auto; }
+
+  table#results {
+    width: 100%;
+    min-width: 640px;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+
+  #results th {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    text-align: left;
+    padding: 0 12px 10px 0;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  #results td {
+    padding: 10px 12px 10px 0;
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--mono);
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+
+  #results td.smiles-cell {
+    font-family: var(--mono);
+  }
+
+  #results th.num, #results td.num { text-align: right; }
+
+  .score-cell { display: flex; align-items: center; gap: 8px; }
+
+  .peak-track {
+    width: 56px;
+    height: 6px;
+    background: var(--teal-dim);
+    border-radius: 2px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .peak-fill {
+    height: 100%;
+    background: var(--teal);
+  }
+
+  /* ---------- footer ---------- */
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    font-size: 12px;
+    color: var(--ink-muted);
+  }
+
+  @media (max-width: 560px) {
+    header.masthead { padding-top: 28px; }
+    .params { gap: 20px; }
+    button#search-btn { margin-left: 0; width: 100%; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+
+  .fade-in { animation: fadeIn 180ms ease-out; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+</style>
+</head>
+<body>
+<main>
+  <header class="masthead">
+    <div class="wordmark">
+      BITMAKO
+      <small>Tanimoto similarity search over a billion-scale compound library</small>
+    </div>
+    <div class="corpus-count" id="corpus-count">connecting…</div>
+  </header>
+
+  <form id="search-form">
+    <span class="eyebrow">SMILES</span>
+    <input id="smiles" name="smiles" type="text" autocomplete="off" spellcheck="false"
+           placeholder="CC(=O)Oc1ccccc1C(=O)O" required>
+
+    <div class="params">
+      <div class="param">
+        <span class="eyebrow">Threshold</span>
+        <input id="threshold" type="number" min="0" max="1" step="any" value="0.7">
+      </div>
+      <div class="param">
+        <span class="eyebrow">Top K</span>
+        <input id="top_k" type="number" min="1" max="500" step="1" value="20">
+      </div>
+      <button type="button" id="advanced-toggle">+ property filters</button>
+      <button type="submit" id="search-btn">Search</button>
+    </div>
+
+    <div class="params" id="advanced-row">
+      <div class="param">
+        <span class="eyebrow">MW max</span>
+        <input id="mw_max" type="number" min="0" step="any" placeholder="none">
+      </div>
+      <div class="param">
+        <span class="eyebrow">LogP max</span>
+        <input id="logp_max" type="number" step="any" placeholder="none">
+      </div>
+      <div class="prop-note" id="prop-note"></div>
+    </div>
+  </form>
+
+  <div id="error-box" role="alert"></div>
+  <div id="empty-box"></div>
+
+  <section id="hero">
+    <div id="hero-count">—</div>
+    <div id="hero-caption"></div>
+  </section>
+
+  <div id="results-wrap"></div>
+
+  <footer>
+    Block-Max WAND over an inverted fingerprint index. Scores are exact Tanimoto
+    similarity, not approximate.
+  </footer>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  var state = { lanceAttached: false, propStoreAttached: false, corpusSize: null };
+
+  var els = {
+    corpusCount: document.getElementById('corpus-count'),
+    form: document.getElementById('search-form'),
+    smiles: document.getElementById('smiles'),
+    threshold: document.getElementById('threshold'),
+    topK: document.getElementById('top_k'),
+    mwMax: document.getElementById('mw_max'),
+    logpMax: document.getElementById('logp_max'),
+    advToggle: document.getElementById('advanced-toggle'),
+    advRow: document.getElementById('advanced-row'),
+    propNote: document.getElementById('prop-note'),
+    searchBtn: document.getElementById('search-btn'),
+    errorBox: document.getElementById('error-box'),
+    emptyBox: document.getElementById('empty-box'),
+    hero: document.getElementById('hero'),
+    heroCount: document.getElementById('hero-count'),
+    heroCaption: document.getElementById('hero-caption'),
+    resultsWrap: document.getElementById('results-wrap'),
+  };
+
+  function fmtInt(n) { return n.toLocaleString('en-US'); }
+
+  function fmtPct(pct) {
+    if (pct === 0) return '0%';
+    var decimals = pct < 0.0001 ? 8 : pct < 0.01 ? 6 : pct < 1 ? 4 : 2;
+    var s = pct.toFixed(decimals);
+    s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return s + '%';
+  }
+
+  function showError(msg) {
+    els.errorBox.textContent = msg;
+    els.errorBox.classList.add('show');
+  }
+  function clearError() {
+    els.errorBox.textContent = '';
+    els.errorBox.classList.remove('show');
+  }
+  function clearEmpty() {
+    els.emptyBox.textContent = '';
+    els.emptyBox.classList.remove('show');
+  }
+
+  els.advToggle.addEventListener('click', function () {
+    els.advRow.classList.toggle('open');
+  });
+
+  fetch('/health')
+    .then(function (r) { return r.json(); })
+    .then(function (h) {
+      state.lanceAttached = !!h.lance_attached;
+      state.propStoreAttached = !!h.prop_store_attached;
+      state.corpusSize = h.compounds;
+      els.corpusCount.innerHTML = '<strong>' + fmtInt(h.compounds) + '</strong> compounds indexed';
+      if (!state.propStoreAttached) {
+        els.mwMax.disabled = true;
+        els.logpMax.disabled = true;
+        els.propNote.textContent = 'Property filters are unavailable — this server was started without --prop-store.';
+      }
+    })
+    .catch(function () {
+      els.corpusCount.textContent = 'health check failed';
+    });
+
+  function buildRequestBody() {
+    var body = {
+      smiles: els.smiles.value.trim(),
+      threshold: parseFloat(els.threshold.value),
+      top_k: parseInt(els.topK.value, 10),
+    };
+    if (els.mwMax.value !== '' && !els.mwMax.disabled) body.mw_max = parseFloat(els.mwMax.value);
+    if (els.logpMax.value !== '' && !els.logpMax.disabled) body.logp_max = parseFloat(els.logpMax.value);
+    return body;
+  }
+
+  function cell(text, opts) {
+    opts = opts || {};
+    var td = document.createElement('td');
+    if (opts.num) td.classList.add('num');
+    if (opts.className) td.classList.add(opts.className);
+    td.textContent = text;
+    return td;
+  }
+
+  function scoreCell(score) {
+    var td = document.createElement('td');
+    var wrap = document.createElement('div');
+    wrap.className = 'score-cell';
+
+    var track = document.createElement('div');
+    track.className = 'peak-track';
+    var fill = document.createElement('div');
+    fill.className = 'peak-fill';
+    fill.style.width = Math.round(score * 100) + '%';
+    track.appendChild(fill);
+
+    var num = document.createElement('span');
+    num.textContent = score.toFixed(4);
+
+    wrap.appendChild(track);
+    wrap.appendChild(num);
+    td.appendChild(wrap);
+    return td;
+  }
+
+  function renderResults(resp) {
+    els.resultsWrap.innerHTML = '';
+
+    var table = document.createElement('table');
+    table.id = 'results';
+    table.className = 'fade-in';
+
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    var headers = ['#', 'Score', 'Doc ID'];
+    if (state.lanceAttached) {
+      headers = headers.concat(['Compound', 'SMILES', 'MW', 'LogP', 'Rot. bonds', 'Heavy atoms', 'Rings']);
+    }
+    headers.forEach(function (h) {
+      var th = document.createElement('th');
+      th.textContent = h;
+      if (h !== '#' && h !== 'Score' && h !== 'Compound' && h !== 'SMILES') th.classList.add('num');
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    resp.results.forEach(function (r, i) {
+      var tr = document.createElement('tr');
+      tr.appendChild(cell(String(i + 1), { num: true }));
+      tr.appendChild(scoreCell(r.score));
+      tr.appendChild(cell(String(r.doc_id), { num: true }));
+      if (state.lanceAttached) {
+        tr.appendChild(cell(r.compound_id != null ? r.compound_id : '—'));
+        tr.appendChild(cell(r.smiles != null ? r.smiles : '—', { className: 'smiles-cell' }));
+        tr.appendChild(cell(r.mw != null ? r.mw.toFixed(1) : '—', { num: true }));
+        tr.appendChild(cell(r.logp != null ? r.logp.toFixed(2) : '—', { num: true }));
+        tr.appendChild(cell(r.rot_bonds != null ? String(r.rot_bonds) : '—', { num: true }));
+        tr.appendChild(cell(r.heavy_atoms != null ? String(r.heavy_atoms) : '—', { num: true }));
+        tr.appendChild(cell(r.ring_count != null ? String(r.ring_count) : '—', { num: true }));
+      }
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    els.resultsWrap.appendChild(table);
+  }
+
+  els.form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    clearError();
+    clearEmpty();
+    els.resultsWrap.innerHTML = '';
+    els.hero.classList.remove('show');
+
+    els.searchBtn.disabled = true;
+    els.searchBtn.textContent = 'Searching…';
+
+    fetch('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildRequestBody()),
+    })
+      .then(function (r) {
+        return r.json().then(function (data) { return { ok: r.ok, data: data }; });
+      })
+      .then(function (res) {
+        if (!res.ok) {
+          showError(res.data.error || 'Search failed.');
+          return;
+        }
+        var resp = res.data;
+        els.heroCount.textContent = fmtInt(resp.docs_evaluated) + ' of ' +
+          (state.corpusSize != null ? fmtInt(state.corpusSize) : '?') + ' evaluated';
+        els.heroCaption.innerHTML = '<span class="frac">' + fmtPct(resp.eval_fraction_pct) +
+          '</span> of the indexed corpus — query popcount ' + resp.query_pop + ' bits';
+        els.hero.classList.add('show');
+
+        if (resp.results.length === 0) {
+          els.emptyBox.textContent = 'No hits above threshold ' + els.threshold.value +
+            ' — try lowering it or widening the property filters.';
+          els.emptyBox.classList.add('show');
+        } else {
+          renderResults(resp);
+        }
+      })
+      .catch(function () {
+        showError('Could not reach the server. Is it still running?');
+      })
+      .finally(function () {
+        els.searchBtn.disabled = false;
+        els.searchBtn.textContent = 'Search';
+      });
+  });
+})();
+</script>
+</body>
+</html>

@@ -27,7 +27,10 @@ library — **1.36 billion compounds** — on a single workstation.
    stdout or a TSV file.
 7. **Serves an HTTP API** (`serve`) — an Axum server wrapping the same `Searcher`,
    loaded once and shared across all requests, so similarity search is
-   network-queryable instead of requiring a CLI process per query.
+   network-queryable instead of requiring a CLI process per query. Visiting the
+   server root in a browser serves a single-page search UI (embedded in the
+   binary, no separate deploy step) with a results table and a live view of the
+   engine's pruning ratio for each query.
 
 ## Scale (this build)
 
@@ -191,6 +194,7 @@ longer requires spawning a CLI process — the mmap'd handles stay warm in the
 running server.
 
 ```
+GET  /       — the search UI (see below)
 GET  /health
   → { "status": "ok", "compounds": 1364304490, "lance_attached": true, "prop_store_attached": true }
 
@@ -207,6 +211,16 @@ same restriction as `search-batch`, for the same reason. `compound_id`/`smiles`/
 property fields on each result are present only when `--lance` was supplied at
 startup. Bad input (out-of-range threshold, unparseable SMILES, filters without a
 prop-store) returns HTTP 400 with `{ "error": "..." }`.
+
+### Search UI
+
+`GET /` serves a single static page (`static/index.html`, embedded into the binary
+via `include_str!` — no separate build step or deploy artifact) with a SMILES
+input, threshold/top-k/property-filter controls, and a results table backed by
+`POST /search`. Property filter inputs disable themselves automatically when
+`/health` reports no prop-store attached. Each search shows the number of
+compounds BMW actually evaluated against the corpus size — the pruning ratio is
+the one fact this UI is built to surface.
 
 > **Tanimoto is size-sensitive.** A small query (few set bits) can't reach a high
 > Tanimoto against the large building-block compounds in REAL — even full
