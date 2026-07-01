@@ -9,6 +9,7 @@
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> [--lance <dataset.lance>] --threshold 0.7 --top-k 100
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --prop-store <store.prop> --query <SMILES> --mw-max 500 --logp-max 5
 //!   bitmako search-batch   --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --queries <queries.smi> --threshold 0.7 --top-k 50 [--output results.tsv]
+//!   bitmako serve          --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> [--prop-store <store.prop>] [--lance <dataset.lance>] [--port 8080]
 
 use std::path::PathBuf;
 use std::process;
@@ -54,11 +55,12 @@ fn main() {
         "build-prop-store" => cmd_build_prop_store(&args[2..]),
         "search" => cmd_search(&args[2..]),
         "search-batch" => cmd_search_batch(&args[2..]),
+        "serve" => cmd_serve(&args[2..]),
         "bench-linear" => cmd_bench_linear(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|search-batch|bench-linear|verify> [options]");
+            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|search-batch|serve|bench-linear|verify> [options]");
             process::exit(1);
         }
     };
@@ -1016,6 +1018,46 @@ fn cmd_search_batch(args: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `serve --index <index.bitmako> --skip <index.skip> --fp-store <store.fp>`
+/// Optional: `--prop-store <store.prop>` `--lance <dataset.lance>` `--bind 127.0.0.1` `--port 8080`
+///
+/// Wraps a `Searcher` in an Axum HTTP server so similarity search is
+/// network-queryable instead of requiring a CLI process per query. The index,
+/// skip, fp-store (and optional prop-store/Lance dataset) are loaded once and
+/// shared across all requests.
+///
+/// Routes:
+///   GET  /health  — liveness + attached-store status
+///   POST /search  — { smiles, threshold?, top_k?, mw_max?, logp_max? } → results
+fn cmd_serve(args: &[String]) -> Result<()> {
+    let index_path = PathBuf::from(require_flag(args, "--index"));
+    let skip_path = PathBuf::from(require_flag(args, "--skip"));
+    let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
+    let prop_store_path: Option<String> = flag_value(args, "--prop-store");
+    let lance_path: Option<String> = flag_value(args, "--lance");
+    let bind = flag_value(args, "--bind").unwrap_or_else(|| "127.0.0.1".to_string());
+    let port: u16 = flag_value(args, "--port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+
+    let index = IndexReader::open(&index_path)?;
+    info!("Loaded index: {} compounds", index.num_compounds);
+    let skip = bitmako::index::skip::SkipIndex::open(&skip_path)?;
+    let fp_store = bitmako::search::fp_store::FpStore::open(&fp_store_path)?;
+    let mut searcher = Searcher::open_from_index(index, skip, fp_store);
+    if let Some(p) = &prop_store_path {
+        let prop_store = bitmako::search::prop_store::PropStore::open(std::path::Path::new(p))?;
+        searcher = searcher.with_prop_store(prop_store);
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(bitmako::error::BitMakoError::Io)?;
+
+    rt.block_on(bitmako::api::run_server(searcher, lance_path, &bind, port))
 }
 
 /// `verify --index <index.bitmako> --fp-store <store.fp> [--sample N]`

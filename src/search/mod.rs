@@ -67,6 +67,17 @@ impl Searcher {
         self
     }
 
+    /// Number of compounds indexed.
+    pub fn num_compounds(&self) -> u32 {
+        self.index.num_compounds
+    }
+
+    /// Whether a property store is attached, enabling `--mw-max`/`--logp-max`
+    /// filters to be screened in-loop instead of silently ignored.
+    pub fn has_prop_store(&self) -> bool {
+        self.prop_store.is_some()
+    }
+
     /// Execute a similarity search returning top-k results.
     ///
     /// When a property store is attached and the query carries property filters,

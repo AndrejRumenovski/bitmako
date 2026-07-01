@@ -16,6 +16,7 @@
 //!                                     (top-k Tanimoto)
 //! ```
 
+pub mod api;
 pub mod error;
 pub mod etl;
 pub mod index;

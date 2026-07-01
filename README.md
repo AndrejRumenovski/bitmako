@@ -25,6 +25,9 @@ library — **1.36 billion compounds** — on a single workstation.
 6. **Batch-searches** a file of SMILES queries (`search-batch`) against one shared,
    mmap'd `Searcher` in parallel across CPU cores (Rayon), writing results to
    stdout or a TSV file.
+7. **Serves an HTTP API** (`serve`) — an Axum server wrapping the same `Searcher`,
+   loaded once and shared across all requests, so similarity search is
+   network-queryable instead of requiring a CLI process per query.
 
 ## Scale (this build)
 
@@ -158,6 +161,10 @@ bitmako search-batch --index compounds.bitmako --skip compounds.skip --fp-store 
 bitmako search-batch --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
     --lance compounds.lance --queries queries.smi --threshold 0.3 --top-k 20 \
     --output results.tsv --stats
+
+# 8. Serve an HTTP API on 127.0.0.1:8080
+bitmako serve --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --prop-store compounds.prop --lance compounds.lance --port 8080
 ```
 
 ### Batch query mode
@@ -175,6 +182,31 @@ TSV file with `--output`. `--lance` resolves SMILES/properties per result via on
 `--prop-store` in batch mode — the legacy `--lance` 20×-over-fetch path isn't
 supported here, to keep the parallel/batched result flow simple. `--threads N`
 overrides Rayon's default thread pool size.
+
+### HTTP API
+
+`serve` loads the index, skip index, and fp-store (plus optional prop-store and
+Lance dataset) once and shares them across every request via `Arc`, so a query no
+longer requires spawning a CLI process — the mmap'd handles stay warm in the
+running server.
+
+```
+GET  /health
+  → { "status": "ok", "compounds": 1364304490, "lance_attached": true, "prop_store_attached": true }
+
+POST /search
+  body: { "smiles": "OC(=O)c1ccccc1", "threshold": 0.3, "top_k": 10, "mw_max": 350, "logp_max": 3 }
+  → { "query_smiles": "...", "query_pop": 37, "results": [
+        { "doc_id": 123, "score": 0.87, "compound_id": "Z...", "smiles": "...", "mw": ..., "logp": ..., "rot_bonds": ..., "heavy_atoms": ..., "ring_count": ... }
+      ], "docs_evaluated": 45, "eval_fraction_pct": 0.0000033 }
+```
+
+`threshold` (default 0.7) and `top_k` (default 50) are optional; `mw_max`/`logp_max`
+are optional but require the server to have been started with `--prop-store` —
+same restriction as `search-batch`, for the same reason. `compound_id`/`smiles`/
+property fields on each result are present only when `--lance` was supplied at
+startup. Bad input (out-of-range threshold, unparseable SMILES, filters without a
+prop-store) returns HTTP 400 with `{ "error": "..." }`.
 
 > **Tanimoto is size-sensitive.** A small query (few set bits) can't reach a high
 > Tanimoto against the large building-block compounds in REAL — even full
