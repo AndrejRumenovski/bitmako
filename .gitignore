@@ -6,3 +6,26 @@
 *.fp
 *.bz2
 handoff.md
+
+# Claude Code local dev config
+.claude/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python (in case of local scripting/tooling)
+__pycache__/
+*.pyc
+
+# Misc temp files
+*.tmp
+*.bak
