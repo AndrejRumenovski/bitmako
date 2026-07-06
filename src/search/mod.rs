@@ -1,6 +1,7 @@
 //! Similarity and property search engine.
 
 pub mod fp_store;
+pub mod lance_lookup;
 pub mod prop_store;
 pub mod query;
 pub mod tanimoto;

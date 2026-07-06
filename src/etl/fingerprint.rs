@@ -238,6 +238,12 @@ fn infer_bond(prev: &Atom, curr: &Atom, explicit: Bond, is_explicit: bool) -> Bo
     }
 }
 
+/// Implicit hydrogen count used for ECFP atom invariants.
+///
+/// Deliberately separate from `properties::default_h_count`: this module and
+/// `etl::properties` each run their own lightweight SMILES scan tuned for their
+/// own purpose (fingerprint invariants vs. MW/LogP estimation), so their default-H
+/// tables take different inputs and are not meant to be unified.
 fn default_h_count(atomic_num: u8, aromatic: bool) -> u8 {
     match atomic_num {
         6 => if aromatic { 0 } else { 4 }, // C: 4 valence, c: aromatic handled later

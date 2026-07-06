@@ -11,7 +11,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use bitmako::etl::fingerprint::compute_morgan_fp;
-use bitmako::etl::parser::{parse_chunk_parallel, ParsedCompound};
+use bitmako::etl::parser::parse_chunk_parallel;
 use bitmako::etl::properties::compute_properties;
 use bitmako::etl::reader::{RawLine, ReaderConfig};
 use bitmako::etl::writer::build_record_batch;

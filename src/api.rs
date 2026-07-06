@@ -16,9 +16,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::error::{BitMakoError, Result};
+use crate::error::{BitMakoError, LanceResultExt, Result};
 use crate::etl::fingerprint::compute_morgan_fp;
-use crate::search::query::{PropertyField, PropertyFilter, SimilarityQuery};
+use crate::search::query::SimilarityQuery;
 use crate::search::Searcher;
 
 struct AppState {
@@ -132,13 +132,8 @@ async fn handle_search(
     }
 
     let query_fp = compute_morgan_fp(&req.smiles);
-    let mut query = SimilarityQuery::new(query_fp, req.threshold, req.top_k);
-    if let Some(max) = req.mw_max {
-        query = query.with_filter(PropertyFilter { field: PropertyField::MolWeight, min: None, max: Some(max) });
-    }
-    if let Some(max) = req.logp_max {
-        query = query.with_filter(PropertyFilter { field: PropertyField::LogP, min: None, max: Some(max) });
-    }
+    let query = SimilarityQuery::new(query_fp, req.threshold, req.top_k)
+        .with_mw_logp_max(req.mw_max, req.logp_max);
     let query_pop = query.query_pop;
 
     let (results, stats) = state
@@ -171,44 +166,22 @@ async fn resolve_via_lance(
     dataset: &lance::dataset::Dataset,
     results: &[(u32, f32)],
 ) -> Result<Vec<SearchResultItem>> {
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::{Float32Type, UInt32Type};
-
-    if results.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let row_indices: Vec<u64> = results.iter().map(|(d, _)| *d as u64).collect();
-    let projection = dataset
-        .schema()
-        .project(&["compound_id", "smiles", "mw", "logp", "rot_bonds", "heavy_atoms", "ring_count"])
-        .map_err(|e| BitMakoError::Lance(e.to_string()))?;
-    let batch = dataset
-        .take(&row_indices, projection)
-        .await
-        .map_err(|e| BitMakoError::Lance(e.to_string()))?;
-
-    let cid_col = batch.column_by_name("compound_id").unwrap().as_string::<i32>();
-    let smi_col = batch.column_by_name("smiles").unwrap().as_string::<i32>();
-    let mw_col = batch.column_by_name("mw").unwrap().as_primitive::<Float32Type>();
-    let logp_col = batch.column_by_name("logp").unwrap().as_primitive::<Float32Type>();
-    let rot_col = batch.column_by_name("rot_bonds").unwrap().as_primitive::<UInt32Type>();
-    let heavy_col = batch.column_by_name("heavy_atoms").unwrap().as_primitive::<UInt32Type>();
-    let ring_col = batch.column_by_name("ring_count").unwrap().as_primitive::<UInt32Type>();
+    let doc_ids: Vec<u32> = results.iter().map(|(doc_id, _)| *doc_id).collect();
+    let resolved = crate::search::lance_lookup::resolve_compounds(dataset, &doc_ids).await?;
 
     Ok(results
         .iter()
-        .enumerate()
-        .map(|(i, (doc_id, score))| SearchResultItem {
-            doc_id: *doc_id,
-            score: *score,
-            compound_id: Some(cid_col.value(i).to_string()),
-            smiles: Some(smi_col.value(i).to_string()),
-            mw: Some(mw_col.value(i)),
-            logp: Some(logp_col.value(i)),
-            rot_bonds: Some(rot_col.value(i)),
-            heavy_atoms: Some(heavy_col.value(i)),
-            ring_count: Some(ring_col.value(i)),
+        .zip(resolved)
+        .map(|(&(doc_id, score), r)| SearchResultItem {
+            doc_id,
+            score,
+            compound_id: Some(r.compound_id),
+            smiles: Some(r.smiles),
+            mw: Some(r.properties.mw),
+            logp: Some(r.properties.logp),
+            rot_bonds: Some(r.properties.rot_bonds),
+            heavy_atoms: Some(r.properties.heavy_atoms),
+            ring_count: Some(r.properties.ring_count),
         })
         .collect())
 }
@@ -220,9 +193,7 @@ async fn resolve_via_lance(
 pub async fn run_server(searcher: Searcher, lance_path: Option<String>, bind: &str, port: u16) -> Result<()> {
     let lance = match lance_path {
         Some(p) => {
-            let dataset = lance::dataset::Dataset::open(&p)
-                .await
-                .map_err(|e| BitMakoError::Lance(e.to_string()))?;
+            let dataset = lance::dataset::Dataset::open(&p).await.lance_err()?;
             info!("Lance dataset attached for SMILES/property resolution: {}", p);
             Some(dataset)
         }

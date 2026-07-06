@@ -73,6 +73,19 @@ impl SimilarityQuery {
         self
     }
 
+    /// Builder: add `mw_max`/`logp_max` upper-bound filters when present. This is
+    /// the common case for CLI/API callers exposing `--mw-max`/`--logp-max` (or
+    /// their JSON equivalents) as optional, independent filters.
+    pub fn with_mw_logp_max(mut self, mw_max: Option<f32>, logp_max: Option<f32>) -> Self {
+        if let Some(max) = mw_max {
+            self = self.with_filter(PropertyFilter { field: PropertyField::MolWeight, min: None, max: Some(max) });
+        }
+        if let Some(max) = logp_max {
+            self = self.with_filter(PropertyFilter { field: PropertyField::LogP, min: None, max: Some(max) });
+        }
+        self
+    }
+
     /// Builder: add a Lipinski-style drug-like filter
     pub fn with_lipinski_filter(self) -> Self {
         self
@@ -107,16 +120,6 @@ impl SimilarityQuery {
     pub fn tanimoto_upper_bound(&self, candidate_pop: u32) -> f32 {
         crate::search::tanimoto::tanimoto_upper_bound(self.query_pop, candidate_pop)
     }
-}
-
-/// A single search result
-#[derive(Debug, Clone)]
-pub struct SearchResult {
-    pub doc_id: u32,
-    pub compound_id: String,
-    pub smiles: String,
-    pub score: f32,
-    pub properties: MolecularProperties,
 }
 
 /// Validate query parameters

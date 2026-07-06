@@ -17,12 +17,12 @@ use std::process;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use bitmako::error::Result;
+use bitmako::error::{BitMakoError, LanceResultExt, Result};
 use bitmako::etl::{PipelineConfig, run_pipeline};
 use bitmako::etl::fingerprint::{compute_morgan_fp, fp_popcount};
 use bitmako::etl::reader::ReaderConfig;
 use bitmako::index::IndexReader;
-use bitmako::search::query::{PropertyField, PropertyFilter, SimilarityQuery};
+use bitmako::search::query::SimilarityQuery;
 use bitmako::search::wand::SearchStats;
 use bitmako::search::Searcher;
 
@@ -75,9 +75,7 @@ fn main() {
 fn cmd_ingest(args: &[String]) -> Result<()> {
     let input = PathBuf::from(require_flag(args, "--input"));
     let output = PathBuf::from(require_flag(args, "--output"));
-    let chunk_size: usize = flag_value(args, "--chunk-size")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100_000);
+    let chunk_size: usize = flag_parsed_or(args, "--chunk-size", 100_000);
 
     let config = PipelineConfig {
         reader: ReaderConfig { chunk_size, ..ReaderConfig::default() },
@@ -111,12 +109,8 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
 
     let lance_path_str = require_flag(args, "--lance");
     let index_path = PathBuf::from(require_flag(args, "--output"));
-    let bits_per_pass: usize = flag_value(args, "--bits-per-pass")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32)
-        .max(1)
-        .min(FP_BITS);
-    let num_passes = (FP_BITS + bits_per_pass - 1) / bits_per_pass;
+    let bits_per_pass: usize = flag_parsed_or(args, "--bits-per-pass", 32).clamp(1, FP_BITS);
+    let num_passes = FP_BITS.div_ceil(bits_per_pass);
 
     info!(
         "Building inverted index: {} bits/pass, {} total scans",
@@ -124,10 +118,7 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
         num_passes + 1
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(bitmako::error::BitMakoError::Io)?;
+    let rt = current_thread_runtime()?;
 
     // ---- Pass 0: collect one popcount byte per compound (~1.4 GB) ----
     info!("Pass 0: collecting compound popcounts...");
@@ -138,28 +129,28 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
 
         let dataset = Dataset::open(&lance_str)
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            .lance_err()?;
         let mut stream = dataset
             .scan()
             .project(&["fingerprint"])
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .lance_err()?
             .try_into_stream()
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            .lance_err()?;
 
         let mut pops: Vec<u8> = Vec::new();
         while let Some(batch) = stream
             .try_next()
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .lance_err()?
         {
             let fp_col = batch
                 .column_by_name("fingerprint")
-                .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("missing fingerprint".into()))?;
+                .ok_or_else(|| BitMakoError::IndexBuild("missing fingerprint".into()))?;
             let list_arr = fp_col
                 .as_any()
                 .downcast_ref::<arrow_array::FixedSizeListArray>()
-                .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("not FixedSizeListArray".into()))?;
+                .ok_or_else(|| BitMakoError::IndexBuild("not FixedSizeListArray".into()))?;
 
             for row in 0..list_arr.len() {
                 let values = list_arr.value(row);
@@ -171,7 +162,7 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
                 pops.push(fp_popcount(&fp) as u8);
             }
         }
-        Ok::<Vec<u8>, bitmako::error::BitMakoError>(pops)
+        Ok::<Vec<u8>, BitMakoError>(pops)
     })?;
 
     let num_compounds = compound_pops.len() as u32;
@@ -182,8 +173,8 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
         .read(true).write(true).create(true).truncate(true)
         .open(&index_path)?;
 
-    out.write_all(b"BITMAKO1")?;
-    out.write_all(&1u32.to_le_bytes())?;
+    out.write_all(bitmako::index::INDEX_MAGIC)?;
+    out.write_all(&bitmako::index::INDEX_VERSION.to_le_bytes())?;
     out.write_all(&num_compounds.to_le_bytes())?;
     out.write_all(&(FP_BITS as u32).to_le_bytes())?;
     // Byte 20: offset table (patched after all passes)
@@ -213,14 +204,14 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
 
             let dataset = Dataset::open(&lance_str)
                 .await
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+                .lance_err()?;
             let mut stream = dataset
                 .scan()
                 .project(&["fingerprint"])
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+                .lance_err()?
                 .try_into_stream()
                 .await
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+                .lance_err()?;
 
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); n_bits];
             let mut doc_id: u32 = 0;
@@ -230,15 +221,15 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
             while let Some(batch) = stream
                 .try_next()
                 .await
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+                .lance_err()?
             {
                 let fp_col = batch
                     .column_by_name("fingerprint")
-                    .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("missing fingerprint".into()))?;
+                    .ok_or_else(|| BitMakoError::IndexBuild("missing fingerprint".into()))?;
                 let list_arr = fp_col
                     .as_any()
                     .downcast_ref::<arrow_array::FixedSizeListArray>()
-                    .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("not FixedSizeListArray".into()))?;
+                    .ok_or_else(|| BitMakoError::IndexBuild("not FixedSizeListArray".into()))?;
 
                 for row in 0..list_arr.len() {
                     let values = list_arr.value(row);
@@ -259,14 +250,14 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
                     doc_id += 1;
                 }
             }
-            Ok::<Vec<Vec<u32>>, bitmako::error::BitMakoError>(lists)
+            Ok::<Vec<Vec<u32>>, BitMakoError>(lists)
         })?;
 
         for (i, doc_ids) in doc_id_lists.into_iter().enumerate() {
             let bit = bit_start + i;
             bit_offsets[bit] = posting_offset;
 
-            let num_blocks = (doc_ids.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            let num_blocks = doc_ids.len().div_ceil(BLOCK_SIZE);
             let block_max_pop: Vec<u8> = (0..num_blocks)
                 .map(|b| {
                     let s = b * BLOCK_SIZE;
@@ -283,7 +274,7 @@ fn cmd_build_index(args: &[String]) -> Result<()> {
                 non_empty_bits += 1;
             }
             let pl = PostingList { doc_ids, block_max_pop };
-            let bytes = pl.serialize().map_err(bitmako::error::BitMakoError::Io)?;
+            let bytes = pl.serialize().map_err(BitMakoError::Io)?;
             out.write_all(&bytes)?;
             posting_offset += bytes.len() as u64;
             total_bytes += bytes.len();
@@ -340,10 +331,7 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
 
     info!("Building flat fingerprint store: {} → {:?}", lance_path_str, output);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(bitmako::error::BitMakoError::Io)?;
+    let rt = current_thread_runtime()?;
 
     let file = File::create(&output)?;
     let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
@@ -355,27 +343,27 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
 
         let dataset = Dataset::open(&lance_path_str)
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            .lance_err()?;
         let mut stream = dataset
             .scan()
             .project(&["fingerprint"])
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .lance_err()?
             .try_into_stream()
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            .lance_err()?;
 
         while let Some(batch) = stream
             .try_next()
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .lance_err()?
         {
             let fp_col = batch
                 .column_by_name("fingerprint")
-                .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("missing fingerprint".into()))?;
+                .ok_or_else(|| BitMakoError::IndexBuild("missing fingerprint".into()))?;
             let list_arr = fp_col
                 .as_any()
                 .downcast_ref::<arrow_array::FixedSizeListArray>()
-                .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild("not FixedSizeListArray".into()))?;
+                .ok_or_else(|| BitMakoError::IndexBuild("not FixedSizeListArray".into()))?;
 
             for row in 0..list_arr.len() {
                 let values = list_arr.value(row);
@@ -387,7 +375,7 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
                     let w = words.get(i).copied().unwrap_or(0);
                     buf[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
                 }
-                writer.write_all(&buf).map_err(bitmako::error::BitMakoError::Io)?;
+                writer.write_all(&buf).map_err(BitMakoError::Io)?;
                 count += 1;
 
                 if count % 100_000_000 == 0 {
@@ -395,10 +383,10 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
                 }
             }
         }
-        Ok::<(), bitmako::error::BitMakoError>(())
+        Ok::<(), BitMakoError>(())
     })?;
 
-    writer.flush().map_err(bitmako::error::BitMakoError::Io)?;
+    writer.flush().map_err(BitMakoError::Io)?;
     info!(
         "Fingerprint store written: {} fingerprints ({} MB)",
         count,
@@ -420,7 +408,7 @@ fn cmd_build_fp_store(args: &[String]) -> Result<()> {
 fn cmd_build_prop_store(args: &[String]) -> Result<()> {
     use std::io::{BufWriter, Write};
     use std::fs::File;
-    use arrow_array::{Array, cast::AsArray};
+    use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt32Type};
     use bitmako::search::prop_store::PROP_BYTES;
 
@@ -429,10 +417,7 @@ fn cmd_build_prop_store(args: &[String]) -> Result<()> {
 
     info!("Building flat property store: {} → {:?}", lance_path_str, output);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(bitmako::error::BitMakoError::Io)?;
+    let rt = current_thread_runtime()?;
 
     let file = File::create(&output)?;
     let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
@@ -444,24 +429,24 @@ fn cmd_build_prop_store(args: &[String]) -> Result<()> {
 
         let dataset = Dataset::open(&lance_path_str)
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            .lance_err()?;
         let mut stream = dataset
             .scan()
             .project(&["mw", "logp", "rot_bonds", "heavy_atoms", "ring_count"])
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .lance_err()?
             .try_into_stream()
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            .lance_err()?;
 
         while let Some(batch) = stream
             .try_next()
             .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?
+            .lance_err()?
         {
             let col = |name: &str| {
                 batch
                     .column_by_name(name)
-                    .ok_or_else(|| bitmako::error::BitMakoError::IndexBuild(format!("missing {}", name)))
+                    .ok_or_else(|| BitMakoError::IndexBuild(format!("missing {}", name)))
             };
             let mw_col    = col("mw")?.as_primitive::<Float32Type>();
             let logp_col  = col("logp")?.as_primitive::<Float32Type>();
@@ -476,7 +461,7 @@ fn cmd_build_prop_store(args: &[String]) -> Result<()> {
                 buf[8..12].copy_from_slice(&(rot_col.value(row) as f32).to_le_bytes());
                 buf[12..16].copy_from_slice(&(heavy_col.value(row) as f32).to_le_bytes());
                 buf[16..20].copy_from_slice(&(ring_col.value(row) as f32).to_le_bytes());
-                writer.write_all(&buf).map_err(bitmako::error::BitMakoError::Io)?;
+                writer.write_all(&buf).map_err(BitMakoError::Io)?;
                 count += 1;
 
                 if count % 100_000_000 == 0 {
@@ -484,10 +469,10 @@ fn cmd_build_prop_store(args: &[String]) -> Result<()> {
                 }
             }
         }
-        Ok::<(), bitmako::error::BitMakoError>(())
+        Ok::<(), BitMakoError>(())
     })?;
 
-    writer.flush().map_err(bitmako::error::BitMakoError::Io)?;
+    writer.flush().map_err(BitMakoError::Io)?;
     info!(
         "Property store written: {} records ({} MB)",
         count,
@@ -513,14 +498,10 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let skip_path = PathBuf::from(require_flag(args, "--skip"));
     let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
     let query_smiles = require_flag(args, "--query");
-    let threshold: f32 = flag_value(args, "--threshold")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.7);
-    let top_k: usize = flag_value(args, "--top-k")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-    let mw_max: Option<f32> = flag_value(args, "--mw-max").and_then(|s| s.parse().ok());
-    let logp_max: Option<f32> = flag_value(args, "--logp-max").and_then(|s| s.parse().ok());
+    let threshold: f32 = flag_parsed_or(args, "--threshold", 0.7);
+    let top_k: usize = flag_parsed_or(args, "--top-k", 50);
+    let mw_max: Option<f32> = flag_parsed(args, "--mw-max");
+    let logp_max: Option<f32> = flag_parsed(args, "--logp-max");
     let lance_path: Option<String> = flag_value(args, "--lance");
     let prop_store_path: Option<String> = flag_value(args, "--prop-store");
     let print_stats = args.iter().any(|a| a == "--stats");
@@ -548,22 +529,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
         );
     }
 
-    let mut query = SimilarityQuery::new(query_fp, threshold, top_k);
-
-    if let Some(max) = mw_max {
-        query = query.with_filter(PropertyFilter {
-            field: PropertyField::MolWeight,
-            min: None,
-            max: Some(max),
-        });
-    }
-    if let Some(max) = logp_max {
-        query = query.with_filter(PropertyFilter {
-            field: PropertyField::LogP,
-            min: None,
-            max: Some(max),
-        });
-    }
+    let query = SimilarityQuery::new(query_fp, threshold, top_k).with_mw_logp_max(mw_max, logp_max);
 
     let has_filters = !query.property_filters.is_empty();
 
@@ -602,12 +568,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
 
     println!("Found {} candidates above threshold {}", results.len(), threshold);
     if print_stats {
-        println!(
-            "WAND stats: evaluated={} ({:.4}% of corpus) pivots_skipped={}",
-            stats.docs_evaluated,
-            stats.eval_fraction() * 100.0,
-            stats.pivots_skipped,
-        );
+        print_stats_line("WAND ", &stats);
     }
 
     if results.is_empty() {
@@ -615,66 +576,31 @@ fn cmd_search(args: &[String]) -> Result<()> {
     }
 
     if let Some(lance_str) = lance_path {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(bitmako::error::BitMakoError::Io)?;
+        let rt = current_thread_runtime()?;
 
         rt.block_on(async {
-            use lance::dataset::Dataset;
-            use arrow_array::cast::AsArray;
-            use arrow_array::types::{Float32Type, UInt32Type};
-            use bitmako::etl::properties::MolecularProperties;
-
-            let dataset = Dataset::open(&lance_str)
-                .await
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
-
-            let row_indices: Vec<u64> = results.iter().map(|(d, _)| *d as u64).collect();
-
-            let projection = dataset
-                .schema()
-                .project(&["compound_id", "smiles", "mw", "logp", "rot_bonds", "heavy_atoms", "ring_count"])
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
-
-            let batch = dataset
-                .take(&row_indices, projection)
-                .await
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
-
-            let cid_col   = batch.column_by_name("compound_id").unwrap().as_string::<i32>();
-            let smi_col   = batch.column_by_name("smiles").unwrap().as_string::<i32>();
-            let mw_col    = batch.column_by_name("mw").unwrap().as_primitive::<Float32Type>();
-            let logp_col  = batch.column_by_name("logp").unwrap().as_primitive::<Float32Type>();
-            let rot_col   = batch.column_by_name("rot_bonds").unwrap().as_primitive::<UInt32Type>();
-            let heavy_col = batch.column_by_name("heavy_atoms").unwrap().as_primitive::<UInt32Type>();
-            let ring_col  = batch.column_by_name("ring_count").unwrap().as_primitive::<UInt32Type>();
+            let dataset = lance::dataset::Dataset::open(&lance_str).await.lance_err()?;
+            let doc_ids: Vec<u32> = results.iter().map(|(d, _)| *d).collect();
+            let resolved = bitmako::search::lance_lookup::resolve_compounds(&dataset, &doc_ids).await?;
 
             // Walk candidates in descending score order; apply property filters; stop at top_k.
             let mut shown = 0usize;
-            for (i, (_, score)) in results.iter().enumerate() {
-                let props = MolecularProperties {
-                    mw:          mw_col.value(i),
-                    logp:        logp_col.value(i),
-                    rot_bonds:   rot_col.value(i),
-                    heavy_atoms: heavy_col.value(i),
-                    ring_count:  ring_col.value(i),
-                };
-                if use_lance_filter && !query.filter_passes(&props) {
+            for ((_, score), r) in results.iter().zip(resolved.iter()) {
+                if use_lance_filter && !query.filter_passes(&r.properties) {
                     continue;
                 }
                 shown += 1;
                 println!(
                     "#{}: compound={} score={:.4} smiles={} mw={:.1} logp={:.2} rot_bonds={} heavy_atoms={} rings={}",
                     shown,
-                    cid_col.value(i),
+                    r.compound_id,
                     score,
-                    smi_col.value(i),
-                    props.mw,
-                    props.logp,
-                    props.rot_bonds,
-                    props.heavy_atoms,
-                    props.ring_count,
+                    r.smiles,
+                    r.properties.mw,
+                    r.properties.logp,
+                    r.properties.rot_bonds,
+                    r.properties.heavy_atoms,
+                    r.properties.ring_count,
                 );
                 if shown == top_k {
                     break;
@@ -685,7 +611,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
                 println!("({} of {} WAND candidates passed property filter)", shown, results.len());
             }
 
-            Ok::<(), bitmako::error::BitMakoError>(())
+            Ok::<(), BitMakoError>(())
         })?;
     } else {
         for (rank, (doc_id, score)) in results.iter().enumerate() {
@@ -742,13 +668,7 @@ fn run_one_query(
     logp_max: Option<f32>,
 ) -> BatchQueryOutcome {
     let query_fp = compute_morgan_fp(&q.smiles);
-    let mut query = SimilarityQuery::new(query_fp, threshold, top_k);
-    if let Some(max) = mw_max {
-        query = query.with_filter(PropertyFilter { field: PropertyField::MolWeight, min: None, max: Some(max) });
-    }
-    if let Some(max) = logp_max {
-        query = query.with_filter(PropertyFilter { field: PropertyField::LogP, min: None, max: Some(max) });
-    }
+    let query = SimilarityQuery::new(query_fp, threshold, top_k).with_mw_logp_max(mw_max, logp_max);
 
     match searcher.search_with_stats(&query) {
         Ok((results, stats)) => BatchQueryOutcome {
@@ -776,12 +696,7 @@ fn print_plain_results(batch: &[BatchQueryOutcome], print_stats: bool) {
         }
         println!("=== {} ({}) === {} results", q.id, q.smiles, q.results.len());
         if print_stats {
-            println!(
-                "  stats: evaluated={} ({:.4}% of corpus) pivots_skipped={}",
-                q.stats.docs_evaluated,
-                q.stats.eval_fraction() * 100.0,
-                q.stats.pivots_skipped,
-            );
+            print_stats_line("  ", &q.stats);
         }
         for (rank, (doc_id, score)) in q.results.iter().enumerate() {
             println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
@@ -824,19 +739,10 @@ fn resolve_and_write_lance(
 ) -> Result<()> {
     use std::io::Write;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(bitmako::error::BitMakoError::Io)?;
+    let rt = current_thread_runtime()?;
 
     rt.block_on(async {
-        use lance::dataset::Dataset;
-        use arrow_array::cast::AsArray;
-        use arrow_array::types::{Float32Type, UInt32Type};
-
-        let dataset = Dataset::open(lance_str)
-            .await
-            .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+        let dataset = lance::dataset::Dataset::open(lance_str).await.lance_err()?;
 
         let mut writer: Box<dyn Write> = match output_path {
             Some(p) => Box::new(std::io::BufWriter::new(std::fs::File::create(p)?)),
@@ -846,14 +752,14 @@ fn resolve_and_write_lance(
             writeln!(
                 writer,
                 "query_id\tquery_smiles\trank\tdoc_id\tscore\tcompound_id\tcompound_smiles\tmw\tlogp\trot_bonds\theavy_atoms\tring_count\tdocs_evaluated\teval_fraction_pct\terror"
-            ).map_err(bitmako::error::BitMakoError::Io)?;
+            ).map_err(BitMakoError::Io)?;
         }
 
         for q in batch {
             if let Some(err) = &q.error {
                 if output_path.is_some() {
                     writeln!(writer, "{}\t{}\t\t\t\t\t\t\t\t\t\t\t\t\t{}", q.id, q.smiles, err)
-                        .map_err(bitmako::error::BitMakoError::Io)?;
+                        .map_err(BitMakoError::Io)?;
                 } else {
                     println!("=== {} ({}) === ERROR: {}", q.id, q.smiles, err);
                 }
@@ -863,12 +769,7 @@ fn resolve_and_write_lance(
             if output_path.is_none() {
                 println!("=== {} ({}) === {} results", q.id, q.smiles, q.results.len());
                 if print_stats {
-                    println!(
-                        "  stats: evaluated={} ({:.4}% of corpus) pivots_skipped={}",
-                        q.stats.docs_evaluated,
-                        q.stats.eval_fraction() * 100.0,
-                        q.stats.pivots_skipped,
-                    );
+                    print_stats_line("  ", &q.stats);
                 }
             }
 
@@ -877,50 +778,37 @@ fn resolve_and_write_lance(
                     writeln!(
                         writer, "{}\t{}\t\t\t\t\t\t\t\t\t\t\t{}\t{:.6}\t",
                         q.id, q.smiles, q.stats.docs_evaluated, q.stats.eval_fraction() * 100.0
-                    ).map_err(bitmako::error::BitMakoError::Io)?;
+                    ).map_err(BitMakoError::Io)?;
                 }
                 continue;
             }
 
-            let row_indices: Vec<u64> = q.results.iter().map(|(d, _)| *d as u64).collect();
-            let projection = dataset
-                .schema()
-                .project(&["compound_id", "smiles", "mw", "logp", "rot_bonds", "heavy_atoms", "ring_count"])
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
-            let batch_rows = dataset
-                .take(&row_indices, projection)
-                .await
-                .map_err(|e| bitmako::error::BitMakoError::Lance(e.to_string()))?;
+            let doc_ids: Vec<u32> = q.results.iter().map(|(d, _)| *d).collect();
+            let resolved = bitmako::search::lance_lookup::resolve_compounds(&dataset, &doc_ids).await?;
 
-            let cid_col   = batch_rows.column_by_name("compound_id").unwrap().as_string::<i32>();
-            let smi_col   = batch_rows.column_by_name("smiles").unwrap().as_string::<i32>();
-            let mw_col    = batch_rows.column_by_name("mw").unwrap().as_primitive::<Float32Type>();
-            let logp_col  = batch_rows.column_by_name("logp").unwrap().as_primitive::<Float32Type>();
-            let rot_col   = batch_rows.column_by_name("rot_bonds").unwrap().as_primitive::<UInt32Type>();
-            let heavy_col = batch_rows.column_by_name("heavy_atoms").unwrap().as_primitive::<UInt32Type>();
-            let ring_col  = batch_rows.column_by_name("ring_count").unwrap().as_primitive::<UInt32Type>();
-
-            for (i, (doc_id, score)) in q.results.iter().enumerate() {
+            for (i, ((doc_id, score), r)) in q.results.iter().zip(resolved.iter()).enumerate() {
                 if output_path.is_some() {
                     writeln!(
                         writer,
                         "{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{:.1}\t{:.2}\t{}\t{}\t{}\t{}\t{:.6}\t",
                         q.id, q.smiles, i + 1, doc_id, score,
-                        cid_col.value(i), smi_col.value(i),
-                        mw_col.value(i), logp_col.value(i), rot_col.value(i), heavy_col.value(i), ring_col.value(i),
+                        r.compound_id, r.smiles,
+                        r.properties.mw, r.properties.logp, r.properties.rot_bonds,
+                        r.properties.heavy_atoms, r.properties.ring_count,
                         q.stats.docs_evaluated, q.stats.eval_fraction() * 100.0,
-                    ).map_err(bitmako::error::BitMakoError::Io)?;
+                    ).map_err(BitMakoError::Io)?;
                 } else {
                     println!(
                         "  #{}: compound={} score={:.4} smiles={} mw={:.1} logp={:.2} rot_bonds={} heavy_atoms={} rings={}",
-                        i + 1, cid_col.value(i), score, smi_col.value(i),
-                        mw_col.value(i), logp_col.value(i), rot_col.value(i), heavy_col.value(i), ring_col.value(i),
+                        i + 1, r.compound_id, score, r.smiles,
+                        r.properties.mw, r.properties.logp, r.properties.rot_bonds,
+                        r.properties.heavy_atoms, r.properties.ring_count,
                     );
                 }
             }
         }
 
-        Ok::<(), bitmako::error::BitMakoError>(())
+        Ok::<(), BitMakoError>(())
     })
 }
 
@@ -944,25 +832,21 @@ fn cmd_search_batch(args: &[String]) -> Result<()> {
     let skip_path = PathBuf::from(require_flag(args, "--skip"));
     let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
     let queries_path = PathBuf::from(require_flag(args, "--queries"));
-    let threshold: f32 = flag_value(args, "--threshold")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.7);
-    let top_k: usize = flag_value(args, "--top-k")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-    let mw_max: Option<f32> = flag_value(args, "--mw-max").and_then(|s| s.parse().ok());
-    let logp_max: Option<f32> = flag_value(args, "--logp-max").and_then(|s| s.parse().ok());
+    let threshold: f32 = flag_parsed_or(args, "--threshold", 0.7);
+    let top_k: usize = flag_parsed_or(args, "--top-k", 50);
+    let mw_max: Option<f32> = flag_parsed(args, "--mw-max");
+    let logp_max: Option<f32> = flag_parsed(args, "--logp-max");
     let lance_path: Option<String> = flag_value(args, "--lance");
     let prop_store_path: Option<String> = flag_value(args, "--prop-store");
     let print_stats = args.iter().any(|a| a == "--stats");
     let output_path: Option<String> = flag_value(args, "--output");
-    let threads: Option<usize> = flag_value(args, "--threads").and_then(|s| s.parse().ok());
+    let threads: Option<usize> = flag_parsed(args, "--threads");
 
     if let Some(n) = threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()
-            .map_err(|e| bitmako::error::BitMakoError::Query(format!("failed to set thread pool size: {}", e)))?;
+            .map_err(|e| BitMakoError::Query(format!("failed to set thread pool size: {}", e)))?;
     }
 
     let has_filters = mw_max.is_some() || logp_max.is_some();
@@ -1038,9 +922,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let prop_store_path: Option<String> = flag_value(args, "--prop-store");
     let lance_path: Option<String> = flag_value(args, "--lance");
     let bind = flag_value(args, "--bind").unwrap_or_else(|| "127.0.0.1".to_string());
-    let port: u16 = flag_value(args, "--port")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8080);
+    let port: u16 = flag_parsed_or(args, "--port", 8080);
 
     let index = IndexReader::open(&index_path)?;
     info!("Loaded index: {} compounds", index.num_compounds);
@@ -1055,7 +937,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(bitmako::error::BitMakoError::Io)?;
+        .map_err(BitMakoError::Io)?;
 
     rt.block_on(bitmako::api::run_server(searcher, lance_path, &bind, port))
 }
@@ -1079,7 +961,7 @@ fn cmd_verify(args: &[String]) -> Result<()> {
 
     let index_path = PathBuf::from(require_flag(args, "--index"));
     let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
-    let sample: Option<usize> = flag_value(args, "--sample").and_then(|s| s.parse().ok());
+    let sample: Option<usize> = flag_parsed(args, "--sample");
 
     let index = IndexReader::open(&index_path)?;
     let fp_store = FpStore::open(&fp_store_path)?;
@@ -1092,7 +974,7 @@ fn cmd_verify(args: &[String]) -> Result<()> {
             "FAIL: count mismatch — index has {} compounds, fp-store has {}",
             n_index, n_fp
         );
-        return Err(bitmako::error::BitMakoError::IndexBuild(
+        return Err(BitMakoError::IndexBuild(
             "index/fp-store compound counts differ".into(),
         ));
     }
@@ -1130,7 +1012,7 @@ fn cmd_verify(args: &[String]) -> Result<()> {
             println!("  MISMATCH doc_id={} index_pop={} fp_pop={}", doc, exp, got);
         }
         println!("FAIL: {} of {} checked doc_ids mismatched", mismatches, limit);
-        Err(bitmako::error::BitMakoError::IndexBuild(format!(
+        Err(BitMakoError::IndexBuild(format!(
             "{} popcount mismatches — index and fp-store are NOT aligned",
             mismatches
         )))
@@ -1153,13 +1035,9 @@ fn cmd_bench_linear(args: &[String]) -> Result<()> {
 
     let fp_store_path = PathBuf::from(require_flag(args, "--fp-store"));
     let query_smiles = require_flag(args, "--query");
-    let threshold: f32 = flag_value(args, "--threshold")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.7);
-    let top_k: usize = flag_value(args, "--top-k")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-    let sample: Option<usize> = flag_value(args, "--sample").and_then(|s| s.parse().ok());
+    let threshold: f32 = flag_parsed_or(args, "--threshold", 0.7);
+    let top_k: usize = flag_parsed_or(args, "--top-k", 50);
+    let sample: Option<usize> = flag_parsed(args, "--sample");
 
     let fp_store = FpStore::open(&fp_store_path)?;
     let total = fp_store.len();
@@ -1205,6 +1083,32 @@ fn cmd_bench_linear(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Print the one-line WAND pruning summary shared by `search`, `search-batch`'s
+/// plain-text output, and `search-batch`'s per-query Lance-resolved output.
+/// `prefix` reproduces each call site's original formatting (`"WAND "` for
+/// single-query `search`, `"  "` for the per-query lines under a batch's
+/// `=== id ===` header).
+fn print_stats_line(prefix: &str, stats: &SearchStats) {
+    println!(
+        "{}stats: evaluated={} ({:.4}% of corpus) pivots_skipped={}",
+        prefix,
+        stats.docs_evaluated,
+        stats.eval_fraction() * 100.0,
+        stats.pivots_skipped,
+    );
+}
+
+/// A single-threaded Tokio runtime for the one-shot async Lance calls each CLI
+/// command needs (open dataset, scan, take). `cmd_serve` builds its own
+/// multi-thread runtime instead, since a long-running server needs to keep
+/// serving requests concurrently rather than block on one task at a time.
+fn current_thread_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(BitMakoError::Io)
+}
+
 fn require_flag(args: &[String], flag: &str) -> String {
     flag_value(args, flag).unwrap_or_else(|| {
         eprintln!("{} is required", flag);
@@ -1215,4 +1119,15 @@ fn require_flag(args: &[String], flag: &str) -> String {
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     let pos = args.iter().position(|a| a == flag)?;
     args.get(pos + 1).cloned()
+}
+
+/// Parse a typed, optional CLI flag (e.g. `--mw-max 350`); `None` if absent or
+/// unparsable as `T`.
+fn flag_parsed<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
+    flag_value(args, flag).and_then(|s| s.parse().ok())
+}
+
+/// Parse a typed CLI flag, falling back to `default` if absent or unparsable.
+fn flag_parsed_or<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
+    flag_parsed(args, flag).unwrap_or(default)
 }

@@ -8,9 +8,9 @@
 //!   2. Advance in document-ID order, merging all cursors.
 //!   3. For each candidate document:
 //!      a. Apply block-level upper bound: if max Tanimoto possible in this
-//!         block is below current threshold, jump to next block (block skip).
+//!      block is below current threshold, jump to next block (block skip).
 //!      b. Apply popcount upper bound: if popcount ratio cannot meet threshold,
-//!         skip without computing full Tanimoto.
+//!      skip without computing full Tanimoto.
 //!      c. Compute exact Tanimoto and update top-k heap.
 //!   4. Dynamically raise threshold as heap fills, increasing skip rate.
 

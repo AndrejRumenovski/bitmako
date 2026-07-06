@@ -13,10 +13,7 @@ use tracing::info;
 use crate::error::{BitMakoError, Result};
 use crate::etl::fingerprint::{fp_popcount, Fingerprint, FP_BITS};
 use crate::index::posting_list::{PostingList, BLOCK_SIZE};
-
-/// On-disk index format constants
-const INDEX_MAGIC: &[u8; 8] = b"BITMAKO1";
-const INDEX_VERSION: u32 = 2; // v2: 8-byte u64 offsets (v1 used 4-byte u32)
+use crate::index::{INDEX_MAGIC, INDEX_VERSION};
 
 /// Accumulates compound fingerprints and builds posting lists incrementally.
 pub struct IndexBuilder {
@@ -26,6 +23,12 @@ pub struct IndexBuilder {
     compound_pops: Vec<u8>,
     /// Total compounds ingested
     num_compounds: u32,
+}
+
+impl Default for IndexBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IndexBuilder {
@@ -67,10 +70,10 @@ impl IndexBuilder {
         let compound_pops = &self.compound_pops;
         let mut finalized = Vec::with_capacity(FP_BITS);
 
-        for (_bit, ids) in self.posting_lists.iter_mut().enumerate() {
+        for ids in self.posting_lists.iter_mut() {
             ids.sort_unstable();
 
-            let num_blocks = (ids.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            let num_blocks = ids.len().div_ceil(BLOCK_SIZE);
             let mut block_max_pop: Vec<u8> = Vec::with_capacity(num_blocks);
 
             for block_idx in 0..num_blocks {

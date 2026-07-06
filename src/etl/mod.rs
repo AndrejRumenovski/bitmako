@@ -18,20 +18,11 @@ use crate::etl::reader::{ReaderConfig, stream_bz2_file};
 use crate::etl::writer::{build_record_batch, write_lance_dataset};
 
 /// Full pipeline configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PipelineConfig {
     pub reader: ReaderConfig,
     /// Number of rayon threads (0 = use all CPUs)
     pub rayon_threads: usize,
-}
-
-impl Default for PipelineConfig {
-    fn default() -> Self {
-        PipelineConfig {
-            reader: ReaderConfig::default(),
-            rayon_threads: 0,
-        }
-    }
 }
 
 /// Statistics collected during ingestion
@@ -77,7 +68,7 @@ pub fn run_pipeline(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| BitMakoError::Io(e))?;
+        .map_err(BitMakoError::Io)?;
 
     let reader_config_2 = config.reader.clone();
     let mut stats = IngestStats::default();
@@ -109,9 +100,7 @@ pub fn run_pipeline(
 
     stats.total_lines = reader_handle
         .join()
-        .map_err(|_| BitMakoError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other, "reader thread panicked"
-        )))??;
+        .map_err(|_| BitMakoError::Io(std::io::Error::other("reader thread panicked")))??;
 
     info!(
         "Pipeline complete. total={} ok={} failed={} batches={}",

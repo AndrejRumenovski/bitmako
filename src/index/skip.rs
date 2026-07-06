@@ -79,10 +79,10 @@ impl SkipIndex {
         }
 
         // Entries: decode each list once, emit (base, byte_offset) per block.
-        for bit in 0..num_bits {
+        for (bit, &nb) in nblocks.iter().enumerate() {
             let lb = index.posting_bytes(bit);
             let entries = build_skip_entries(lb);
-            debug_assert_eq!(entries.len(), nblocks[bit] as usize);
+            debug_assert_eq!(entries.len(), nb as usize);
             for (base, off) in entries {
                 w.write_all(&base.to_le_bytes())?;
                 w.write_all(&off.to_le_bytes())?;

@@ -28,6 +28,12 @@ pub struct PostingList {
     pub block_max_pop: Vec<u8>,
 }
 
+impl Default for PostingList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PostingList {
     pub fn new() -> Self {
         PostingList {
@@ -50,7 +56,7 @@ impl PostingList {
     /// Number of full + partial blocks
     #[inline]
     pub fn num_blocks(&self) -> usize {
-        (self.doc_ids.len() + BLOCK_SIZE - 1) / BLOCK_SIZE
+        self.doc_ids.len().div_ceil(BLOCK_SIZE)
     }
 
     /// Block-level max popcount for block `b`

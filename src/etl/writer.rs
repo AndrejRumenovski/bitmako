@@ -69,7 +69,7 @@ pub fn build_record_batch(compounds: &[ParsedCompound]) -> Result<RecordBatch> {
     let fp_values_array = Arc::new(UInt64Array::from(fp_values)) as Arc<dyn Array>;
     let fp_field = Arc::new(Field::new("item", DataType::UInt64, false));
     let fingerprint = FixedSizeListArray::try_new(fp_field, FP_WORDS as i32, fp_values_array, None)
-        .map_err(|e| BitMakoError::Arrow(e))?;
+        .map_err(BitMakoError::Arrow)?;
 
     let batch = RecordBatch::try_new(
         schema,

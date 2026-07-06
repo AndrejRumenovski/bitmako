@@ -28,12 +28,6 @@ pub fn tanimoto(a: &Fingerprint, b: &Fingerprint) -> f32 {
     intersection as f32 / union_bits as f32
 }
 
-/// Compute Tanimoto from raw word slices (avoids double-dereference overhead in hot paths)
-#[inline]
-pub fn tanimoto_slice(a: &[u64; FP_WORDS], b: &[u64; FP_WORDS]) -> f32 {
-    tanimoto(a, b)
-}
-
 /// Check if Tanimoto meets threshold without computing exact score (early termination).
 /// Returns (similarity, met_threshold).
 #[inline]

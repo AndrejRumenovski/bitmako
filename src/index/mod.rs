@@ -13,7 +13,22 @@ use tracing::info;
 use crate::error::{BitMakoError, Result};
 use crate::index::posting_list::PostingList;
 
-const INDEX_MAGIC: &[u8; 8] = b"BITMAKO1";
+/// On-disk index file magic bytes, shared by every writer of the `*.bitmako`
+/// format (`IndexBuilder::write_index` and the streaming multi-pass builder in
+/// `main.rs`'s `cmd_build_index`) and validated here on read.
+pub const INDEX_MAGIC: &[u8; 8] = b"BITMAKO1";
+/// Current on-disk index format version, written by every builder as of this
+/// commit: 8-byte (u64) posting-list offsets, supporting posting sections over
+/// 4 GiB.
+///
+/// Note: an earlier build of `cmd_build_index` wrote version `1` into the header
+/// by mistake while *already* using this same 8-byte-offset layout (a 4-byte-offset
+/// v1 format was never actually implemented anywhere in this codebase). `IndexReader`
+/// therefore accepts both `1` and `2` on read — see `SUPPORTED_INDEX_VERSIONS` — so
+/// existing index files built before this fix keep working.
+pub const INDEX_VERSION: u32 = 2;
+/// Version values `IndexReader::open` accepts; see `INDEX_VERSION`.
+const SUPPORTED_INDEX_VERSIONS: [u32; 2] = [1, 2];
 
 /// Memory-mapped read-only view of a serialized inverted index.
 ///
@@ -54,7 +69,13 @@ impl IndexReader {
             u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
         };
 
-        let _version = read_u32(8);
+        let version = read_u32(8);
+        if !SUPPORTED_INDEX_VERSIONS.contains(&version) {
+            return Err(BitMakoError::IndexBuild(format!(
+                "unsupported index version {} (expected one of {:?})",
+                version, SUPPORTED_INDEX_VERSIONS
+            )));
+        }
         let num_compounds = read_u32(12);
         let num_bits = read_u32(16);
 

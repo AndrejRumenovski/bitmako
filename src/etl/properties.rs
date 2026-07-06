@@ -49,7 +49,10 @@ fn atomic_mass(symbol: &str) -> f32 {
     }
 }
 
-/// Default implicit hydrogen count in organic subset
+/// Default implicit hydrogen count in organic subset, for property estimation.
+///
+/// Deliberately separate from `fingerprint::default_h_count`: see the doc comment
+/// there for why the two modules don't share one table.
 #[inline]
 fn default_h_count(symbol: &str) -> u8 {
     match symbol {
@@ -117,9 +120,9 @@ fn scan_tokens(smiles: &str) -> Vec<Token<'_>> {
             }
             'B' | 'C' | 'N' | 'O' | 'F' | 'P' | 'S' | 'I'
             | 'c' | 'n' | 'o' | 's' | 'p' => {
-                let (sym, advance) = if ch == 'B' && i + 1 < len && bytes[i + 1] == b'r' {
-                    (&smiles[i..i + 2], 2)
-                } else if ch == 'C' && i + 1 < len && bytes[i + 1] == b'l' {
+                let is_two_char_halogen = (ch == 'B' && i + 1 < len && bytes[i + 1] == b'r')
+                    || (ch == 'C' && i + 1 < len && bytes[i + 1] == b'l');
+                let (sym, advance) = if is_two_char_halogen {
                     (&smiles[i..i + 2], 2)
                 } else {
                     (&smiles[i..i + 1], 1)

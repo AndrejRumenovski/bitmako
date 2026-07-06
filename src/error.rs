@@ -40,3 +40,18 @@ impl From<bincode::Error> for BitMakoError {
 }
 
 pub type Result<T> = std::result::Result<T, BitMakoError>;
+
+/// Converts any displayable error (Lance's error type in practice) into
+/// `BitMakoError::Lance`. Lance operations (`Dataset::open`, `.scan()`, `.take()`,
+/// stream iteration, ...) all return their own error type, so without this every
+/// call site needs `.map_err(|e| BitMakoError::Lance(e.to_string()))` spelled out —
+/// this lets call sites write `.lance_err()?` instead.
+pub trait LanceResultExt<T> {
+    fn lance_err(self) -> Result<T>;
+}
+
+impl<T, E: std::fmt::Display> LanceResultExt<T> for std::result::Result<T, E> {
+    fn lance_err(self) -> Result<T> {
+        self.map_err(|e| BitMakoError::Lance(e.to_string()))
+    }
+}
