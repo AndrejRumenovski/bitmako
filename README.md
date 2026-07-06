@@ -605,4 +605,4 @@ this build — 0 mismatches).
 
 ## License
 
-MIT
+[MIT](LICENSE)

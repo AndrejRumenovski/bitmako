@@ -29,3 +29,11 @@ __pycache__/
 # Misc temp files
 *.tmp
 *.bak
+*.log
+*.orig
+*.rej
+*.rs.bk
+
+# Local secrets/environment overrides
+.env
+.env.*
