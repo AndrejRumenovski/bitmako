@@ -70,6 +70,13 @@ struct SearchResultItem {
     heavy_atoms: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ring_count: Option<u32>,
+    /// Similarity Analysis panel fields — always present, independent of
+    /// `--lance`, since they come from the fingerprints alone. See
+    /// `search::analysis`.
+    shared_bits: u32,
+    query_unique_bits: u32,
+    candidate_unique_bits: u32,
+    explanation: String,
 }
 
 #[derive(Serialize)]
@@ -144,7 +151,7 @@ async fn handle_search(
             other => internal_error(other),
         })?;
 
-    let items = if let Some(dataset) = &state.lance {
+    let mut items = if let Some(dataset) = &state.lance {
         resolve_via_lance(dataset, &results).await.map_err(internal_error)?
     } else {
         results
@@ -152,6 +159,15 @@ async fn handle_search(
             .map(|(doc_id, score)| SearchResultItem { doc_id: *doc_id, score: *score, ..Default::default() })
             .collect()
     };
+
+    // Similarity Analysis: a cheap post-processing pass over the top-k results
+    // already found above, not a second search — see `search::analysis`.
+    for (item, analysis) in items.iter_mut().zip(state.searcher.analyze_results(&query, &results)) {
+        item.shared_bits = analysis.shared_bits;
+        item.query_unique_bits = analysis.query_unique_bits;
+        item.candidate_unique_bits = analysis.candidate_unique_bits;
+        item.explanation = analysis.explanation;
+    }
 
     Ok(Json(SearchResponse {
         query_smiles: req.smiles,
@@ -182,6 +198,9 @@ async fn resolve_via_lance(
             rot_bonds: Some(r.properties.rot_bonds),
             heavy_atoms: Some(r.properties.heavy_atoms),
             ring_count: Some(r.properties.ring_count),
+            // Similarity Analysis fields are filled in by the caller (`handle_search`),
+            // which has the query fingerprint needed to compute them.
+            ..Default::default()
         })
         .collect())
 }

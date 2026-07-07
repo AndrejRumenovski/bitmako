@@ -282,6 +282,68 @@
     background: var(--teal);
   }
 
+  /* ---------- similarity analysis panel ---------- */
+
+  .analysis-toggle {
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--teal);
+    background: none;
+    border: 1px solid var(--teal-dim);
+    border-radius: 3px;
+    padding: 4px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .analysis-toggle:hover { background: var(--teal-dim); }
+  .analysis-toggle[aria-expanded="true"] {
+    background: var(--teal);
+    border-color: var(--teal);
+    color: #fff;
+  }
+
+  tr.analysis-row { display: none; }
+  tr.analysis-row.open { display: table-row; }
+  #results tr.analysis-row td {
+    padding: 16px 20px;
+    background: #FAFCFB;
+    white-space: normal;
+  }
+
+  .analysis-panel { max-width: 640px; }
+
+  .analysis-stats {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+
+  .analysis-stat-label {
+    display: block;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+  }
+  .analysis-stat-value {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .analysis-stat-value.shared { color: var(--teal); }
+
+  .analysis-explanation {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+
   /* ---------- footer ---------- */
 
   footer {
@@ -474,6 +536,61 @@
     return td;
   }
 
+  function analysisStat(label, value, opts) {
+    opts = opts || {};
+    var wrap = document.createElement('div');
+    var lbl = document.createElement('span');
+    lbl.className = 'analysis-stat-label';
+    lbl.textContent = label;
+    var val = document.createElement('span');
+    val.className = 'analysis-stat-value' + (opts.shared ? ' shared' : '');
+    val.textContent = value;
+    wrap.appendChild(lbl);
+    wrap.appendChild(val);
+    return wrap;
+  }
+
+  // One hidden detail row per result: the bit-level breakdown behind the
+  // Tanimoto score plus the generated explanation. Collapsed by default so
+  // the results table itself stays a clean, scannable ranking; the panel is
+  // one click away for anyone who wants to see *why* a hit matched.
+  function analysisRow(r, colspan) {
+    var tr = document.createElement('tr');
+    tr.className = 'analysis-row';
+    var td = document.createElement('td');
+    td.colSpan = colspan;
+
+    var panel = document.createElement('div');
+    panel.className = 'analysis-panel';
+
+    var stats = document.createElement('div');
+    stats.className = 'analysis-stats';
+    stats.appendChild(analysisStat('Shared bits', fmtInt(r.shared_bits), { shared: true }));
+    stats.appendChild(analysisStat('Query-unique bits', fmtInt(r.query_unique_bits)));
+    stats.appendChild(analysisStat('Candidate-unique bits', fmtInt(r.candidate_unique_bits)));
+    panel.appendChild(stats);
+
+    var explanation = document.createElement('p');
+    explanation.className = 'analysis-explanation';
+    explanation.textContent = r.explanation;
+    panel.appendChild(explanation);
+
+    td.appendChild(panel);
+    tr.appendChild(td);
+    return tr;
+  }
+
+  function analysisToggleCell() {
+    var td = document.createElement('td');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'analysis-toggle';
+    btn.setAttribute('aria-expanded', 'false');
+    btn.textContent = 'Analysis';
+    td.appendChild(btn);
+    return td;
+  }
+
   function renderResults(resp) {
     els.resultsWrap.innerHTML = '';
 
@@ -487,10 +604,13 @@
     if (state.lanceAttached) {
       headers = headers.concat(['Compound', 'SMILES', 'MW', 'LogP', 'Rot. bonds', 'Heavy atoms', 'Rings']);
     }
+    headers.push('Similarity Analysis');
     headers.forEach(function (h) {
       var th = document.createElement('th');
       th.textContent = h;
-      if (h !== '#' && h !== 'Score' && h !== 'Compound' && h !== 'SMILES') th.classList.add('num');
+      if (h !== '#' && h !== 'Score' && h !== 'Compound' && h !== 'SMILES' && h !== 'Similarity Analysis') {
+        th.classList.add('num');
+      }
       headRow.appendChild(th);
     });
     thead.appendChild(headRow);
@@ -511,9 +631,22 @@
         tr.appendChild(cell(r.heavy_atoms != null ? String(r.heavy_atoms) : '—', { num: true }));
         tr.appendChild(cell(r.ring_count != null ? String(r.ring_count) : '—', { num: true }));
       }
+      tr.appendChild(analysisToggleCell());
       tbody.appendChild(tr);
+      tbody.appendChild(analysisRow(r, headers.length));
     });
     table.appendChild(tbody);
+
+    // Event delegation: one listener for every toggle button in the table,
+    // rather than one per row.
+    table.addEventListener('click', function (e) {
+      var btn = e.target.closest('.analysis-toggle');
+      if (!btn) return;
+      var detailRow = btn.closest('tr').nextElementSibling;
+      var expanded = detailRow.classList.toggle('open');
+      btn.setAttribute('aria-expanded', String(expanded));
+    });
+
     els.resultsWrap.appendChild(table);
   }
 

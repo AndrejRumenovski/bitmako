@@ -21,6 +21,7 @@
 - [Features](#features)
 - [Scale (This Build)](#scale-this-build)
 - [Architecture Overview](#architecture-overview)
+- [Similarity Analysis](#similarity-analysis)
 - [Design Decisions](#design-decisions)
 - [Engineering Challenges](#engineering-challenges)
 - [Benchmark Results](#benchmark-results)
@@ -85,7 +86,11 @@ majority of the corpus per query.
    SMILES, using BMW dynamic pruning to avoid scanning the full corpus.
    Property filters (`--mw-max`, `--logp-max`) are evaluated inside the pivot
    loop via O(1) mmap reads — before the fingerprint fetch — so the engine
-   returns exactly top-k filtered results with no over-fetch.
+   returns exactly top-k filtered results with no over-fetch. Each result
+   also carries a **Similarity Analysis**: shared/unique fingerprint bit
+   counts and a generated explanation of the match, computed as a cheap
+   post-processing step over the returned results — never inside the pivot
+   loop, so it costs nothing in search performance.
 6. **Batch-searches** a file of SMILES queries (`search-batch`) against one
    shared, mmap'd `Searcher` in parallel across CPU cores (Rayon), writing
    results to stdout or a TSV file.
@@ -111,6 +116,12 @@ columns when `--lance` is attached:
 
 ![Live pruning readout and results table](docs/screenshots/pruning-readout.png)
 
+**Similarity Analysis panel, expanded** — clicking "Analysis" on any result
+reveals the bit-level breakdown behind its score and a generated explanation
+of the match, without cluttering the default table view:
+
+![Similarity Analysis panel expanded for one result](docs/screenshots/similarity-analysis.png)
+
 > Rendered from the shipped `static/index.html` with representative sample
 > data standing in for a live 1.36B-compound backend.
 
@@ -131,6 +142,12 @@ columns when `--lance` is attached:
   single shared in-memory `Searcher` — no per-query process spin-up.
 - **Embedded single-page search UI** — served directly from the compiled
   binary (`include_str!`), zero separate deploy artifact.
+- **Similarity Analysis panel** — every result carries a bit-level breakdown
+  (shared / query-unique / candidate-unique fingerprint bits) and a
+  generated 1–2 sentence explanation of *why* it matched, computed fresh from
+  the actual fingerprint comparison — not canned text. Costs one extra mmap
+  read per *returned* result, not per candidate evaluated, so it doesn't
+  touch WAND's pruning loop or its performance.
 - **Memory-bounded index construction** — multi-pass builder trades peak RAM
   against pass count, so a 70 GB index can be built without loading it whole.
 - **Verified-exact streaming search** — the skip-cursor implementation is
@@ -230,6 +247,66 @@ store, compute exact Tanimoto, and update the top-k min-heap.
 The streaming cursor is verified against an exhaustive linear scan in the
 test suite (identical results across many queries × thresholds).
 
+## Similarity Analysis
+
+A Tanimoto score answers "how similar," but not "similar *how*." The
+Similarity Analysis panel closes that gap: for every result, it breaks the
+score down into the actual bits driving it and generates a short explanation
+from those numbers — surfaced as an expandable panel per row in the web UI,
+extra fields on every `POST /search` result, and extra output lines under
+the single-query `search` CLI command.
+
+**What's computed**, for a query fingerprint `Q` and a candidate `C` (both
+1024-bit):
+
+| Field | Meaning |
+|---|---|
+| `shared_bits` | `popcount(Q & C)` — bits set in both |
+| `query_unique_bits` | `popcount(Q & !C)` — bits set only in the query |
+| `candidate_unique_bits` | `popcount(C & !Q)` — bits set only in the candidate |
+| `explanation` | 1–2 sentences generated from the three counts above |
+
+`shared_bits + query_unique_bits + candidate_unique_bits` is the Tanimoto
+union, so `tanimoto = shared_bits / total` — recomputed here from the same
+two fingerprints WAND already scored, and numerically identical to the
+`score` field (verified in `search::analysis`'s test suite). The explanation
+sentence bands the score into a qualitative tier (`high` ≥ 0.7, `moderate`
+≥ 0.4, `low but notable` ≥ 0.2, `minimal` below that) purely to pick a word —
+every number quoted in the sentence itself is the real, freshly computed
+value for that specific pair, not a lookup or a template with blanks filled
+from metadata.
+
+**Where it lives:** `src/search/analysis.rs` is a small, pure, dependency-free
+module — one function, `analyze(query_fp, candidate_fp) -> SimilarityAnalysis`,
+built entirely from two `[u64; 16]` arrays. It doesn't know about `Searcher`,
+Lance, Axum, or HTTP; it's a fingerprint-comparison function with a test
+suite that stands on its own. `Searcher::analyze_results` is the only glue:
+it takes a search's own `(doc_id, score)` output, re-fetches each candidate's
+fingerprint from the same flat `FpStore` mmap WAND itself reads from (one
+O(1) lookup per result), and calls `analyze`. The HTTP API, the CLI, and any
+future caller all go through that one method — no duplicated bit-counting
+logic anywhere.
+
+**Why this doesn't affect search performance:** `analyze_results` runs once,
+*after* `search_with_stats` returns, over the already-ranked top-k list —
+typically tens to a few hundred entries. It never runs inside `BmwEngine`'s
+pivot loop, so it has zero effect on posting-list traversal, block-max
+pruning, or the early-exit heuristic — the numbers in
+[Benchmark Results](#benchmark-results) are unchanged. Concretely: computing
+the analysis for 50 results costs 50 extra mmap reads (128 bytes each,
+already page-cache-warm since WAND just read the same bytes to score them)
+plus 50 sixteen-word bit scans — microseconds, not a measurable fraction of
+a multi-second search.
+
+**Scope:** wired into the HTTP API (`POST /search`, see
+[API Documentation](#api-documentation)), the web UI (an expandable
+"Analysis" panel per result row, collapsed by default so the results table
+stays scannable), and the single-query `search` CLI command. Deliberately
+*not* wired into `search-batch`'s TSV/stdout output — a multi-sentence prose
+explanation doesn't fit a tabular bulk-export format, and anyone scripting
+against batch results can call the same `analyze`/`analyze_results` functions
+directly from the library.
+
 ## Design Decisions
 
 - **Exact results over approximate nearest neighbors.** Approximate
@@ -274,6 +351,17 @@ test suite (identical results across many queries × thresholds).
   run as a single self-contained artifact on a workstation; a second
   deployment target for the frontend would be disproportionate to its size
   (one HTML file).
+- **Similarity Analysis as a post-search pass, not a WAND feature.** The
+  bit-level breakdown behind each result (shared/unique bits, the generated
+  explanation) is computed by re-comparing two already-fetched fingerprints
+  *after* WAND has already picked the top-k — never inside the pivot loop,
+  which only ever sees fingerprints for candidates it's still deciding about,
+  most of which it prunes without a full comparison. Computing the analysis
+  for the small returned result set (≤ a few hundred) costs a handful of
+  extra O(1) mmap reads and 16-word bit scans; running it inside the hot loop
+  instead would mean doing that work for every candidate WAND *rules out*,
+  which is exactly the cost WAND's pruning exists to avoid. See
+  [Similarity Analysis](#similarity-analysis).
 - **Pure Rust, no GPU.** The bottleneck at this scale is I/O and posting-list
   traversal, not floating-point throughput — GPU acceleration wouldn't
   address the actual cost center, whereas `target-cpu=native` POPCNT/AVX2
@@ -436,7 +524,10 @@ the binary via `include_str!` — no separate build step or deploy artifact).
 Property-filter inputs auto-disable when `/health` reports no prop-store
 attached. Each search surfaces the number of compounds BMW actually
 evaluated against the corpus size — the pruning ratio is the one fact the
-UI is built to make visible.
+UI is built to make visible. Each result row also carries a collapsed
+"Analysis" toggle exposing its [Similarity Analysis](#similarity-analysis)
+panel — the bit-level breakdown and generated explanation — without
+cluttering the default table view.
 
 ### `GET /health`
 
@@ -482,7 +573,11 @@ UI is built to make visible.
       "logp": 1.2,
       "rot_bonds": 1,
       "heavy_atoms": 13,
-      "ring_count": 1
+      "ring_count": 1,
+      "shared_bits": 32,
+      "query_unique_bits": 5,
+      "candidate_unique_bits": 0,
+      "explanation": "This molecule shares 87% of its structural fingerprint with the query (32 of 37 total bits), indicating a high degree of structural similarity. 5 bits appear only in the query and 0 bits appear only in this molecule."
     }
   ],
   "docs_evaluated": 45,
@@ -493,6 +588,10 @@ UI is built to make visible.
 `compound_id`/`smiles`/property fields on each result are present only when
 `--lance` was supplied at server startup. `docs_evaluated`/
 `eval_fraction_pct` report the pruning ratio for that specific query.
+`shared_bits`/`query_unique_bits`/`candidate_unique_bits`/`explanation` are
+the [Similarity Analysis](#similarity-analysis) panel fields — always
+present regardless of `--lance`, since they're derived purely from the
+fingerprints.
 
 **Error responses** — HTTP 400 with a JSON body, for: out-of-range
 threshold, unparseable SMILES, `top_k=0`, or property filters requested

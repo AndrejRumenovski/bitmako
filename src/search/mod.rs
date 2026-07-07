@@ -1,5 +1,6 @@
 //! Similarity and property search engine.
 
+pub mod analysis;
 pub mod fp_store;
 pub mod lance_lookup;
 pub mod prop_store;
@@ -15,6 +16,7 @@ use crate::error::Result;
 use crate::etl::fingerprint::compute_morgan_fp;
 use crate::index::skip::SkipIndex;
 use crate::index::IndexReader;
+use crate::search::analysis::{analyze, SimilarityAnalysis};
 use crate::search::fp_store::FpStore;
 use crate::search::prop_store::PropStore;
 use crate::search::query::SimilarityQuery;
@@ -120,6 +122,22 @@ impl Searcher {
             ),
             _ => engine.search_with_stats(query, |doc_id| self.fp_store.get(doc_id)),
         }
+    }
+
+    /// Compute a [`SimilarityAnalysis`] for each `(doc_id, score)` result,
+    /// re-fetching each candidate's fingerprint from the flat store — one O(1)
+    /// mmap read per result, the same store WAND itself reads from. `results`
+    /// is expected to be a search's own output (already top-k, not the
+    /// corpus), so this is a cheap, order-preserving post-processing pass, not
+    /// a second search. Doc IDs the store can't resolve (shouldn't happen for
+    /// results a search just returned) are silently skipped, so the returned
+    /// vector may be shorter than `results` in that edge case.
+    pub fn analyze_results(&self, query: &SimilarityQuery, results: &[(u32, f32)]) -> Vec<SimilarityAnalysis> {
+        results
+            .iter()
+            .filter_map(|(doc_id, _)| self.fp_store.get(*doc_id))
+            .map(|candidate_fp| analyze(&query.query_fp, &candidate_fp))
+            .collect()
     }
 
     /// Convenience: search by SMILES string instead of pre-computed fingerprint.

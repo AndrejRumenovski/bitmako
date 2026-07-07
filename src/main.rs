@@ -575,6 +575,10 @@ fn cmd_search(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // Similarity Analysis: a cheap post-processing pass over the top-k results
+    // above, not a second search — see `bitmako::search::analysis`.
+    let analyses = searcher.analyze_results(&search_query, &results);
+
     if let Some(lance_str) = lance_path {
         let rt = current_thread_runtime()?;
 
@@ -585,7 +589,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
 
             // Walk candidates in descending score order; apply property filters; stop at top_k.
             let mut shown = 0usize;
-            for ((_, score), r) in results.iter().zip(resolved.iter()) {
+            for (((_, score), r), a) in results.iter().zip(resolved.iter()).zip(analyses.iter()) {
                 if use_lance_filter && !query.filter_passes(&r.properties) {
                     continue;
                 }
@@ -602,6 +606,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
                     r.properties.heavy_atoms,
                     r.properties.ring_count,
                 );
+                print_similarity_analysis(a);
                 if shown == top_k {
                     break;
                 }
@@ -614,12 +619,27 @@ fn cmd_search(args: &[String]) -> Result<()> {
             Ok::<(), BitMakoError>(())
         })?;
     } else {
-        for (rank, (doc_id, score)) in results.iter().enumerate() {
+        for (rank, ((doc_id, score), a)) in results.iter().zip(analyses.iter()).enumerate() {
             println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
+            print_similarity_analysis(a);
         }
     }
 
     Ok(())
+}
+
+/// Print the "Similarity Analysis" breakdown for one result under `search`'s
+/// human-readable output: the bit-level counts behind the Tanimoto score,
+/// plus the generated explanation. Not used by `search-batch`'s TSV output —
+/// a prose sentence doesn't fit a tabular bulk format, and the same numbers
+/// are one `bitmako::search::analysis::analyze` call away for anyone scripting
+/// against the library or the HTTP API instead.
+fn print_similarity_analysis(a: &bitmako::search::analysis::SimilarityAnalysis) {
+    println!(
+        "      shared_bits={} query_unique_bits={} candidate_unique_bits={}",
+        a.shared_bits, a.query_unique_bits, a.candidate_unique_bits
+    );
+    println!("      {}", a.explanation);
 }
 
 /// One query line parsed from a `--queries` file: `SMILES [ID]` per line,
