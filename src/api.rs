@@ -86,6 +86,11 @@ struct SearchResponse {
     results: Vec<SearchResultItem>,
     docs_evaluated: u64,
     eval_fraction_pct: f64,
+    /// Wall-clock time spent in `Searcher::search_with_stats` — the WAND
+    /// search itself, not JSON serialization or (when `--lance` is attached)
+    /// the SMILES/property lookup that happens afterward. Search Statistics
+    /// panel field; see `handle_search`.
+    search_time_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -94,6 +99,7 @@ struct HealthResponse {
     compounds: u32,
     lance_attached: bool,
     prop_store_attached: bool,
+    fingerprint_type: &'static str,
 }
 
 #[derive(Serialize)]
@@ -117,6 +123,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
         compounds: state.searcher.num_compounds(),
         lance_attached: state.lance.is_some(),
         prop_store_attached: state.searcher.has_prop_store(),
+        fingerprint_type: crate::etl::fingerprint::FINGERPRINT_KIND,
     })
 }
 
@@ -143,6 +150,10 @@ async fn handle_search(
         .with_mw_logp_max(req.mw_max, req.logp_max);
     let query_pop = query.query_pop;
 
+    // Timed strictly around the search itself (Search Statistics panel's
+    // "execution time" field) — excludes JSON serialization and, when
+    // `--lance` is attached, the SMILES/property lookup that happens after.
+    let search_started = std::time::Instant::now();
     let (results, stats) = state
         .searcher
         .search_with_stats(&query)
@@ -150,6 +161,7 @@ async fn handle_search(
             BitMakoError::Query(msg) => bad_request(msg),
             other => internal_error(other),
         })?;
+    let search_time_ms = search_started.elapsed().as_secs_f64() * 1000.0;
 
     let mut items = if let Some(dataset) = &state.lance {
         resolve_via_lance(dataset, &results).await.map_err(internal_error)?
@@ -175,6 +187,7 @@ async fn handle_search(
         results: items,
         docs_evaluated: stats.docs_evaluated,
         eval_fraction_pct: stats.eval_fraction() * 100.0,
+        search_time_ms,
     }))
 }
 

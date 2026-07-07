@@ -22,6 +22,7 @@
 - [Scale (This Build)](#scale-this-build)
 - [Architecture Overview](#architecture-overview)
 - [Similarity Analysis](#similarity-analysis)
+- [Search Statistics](#search-statistics)
 - [Design Decisions](#design-decisions)
 - [Engineering Challenges](#engineering-challenges)
 - [Benchmark Results](#benchmark-results)
@@ -108,13 +109,14 @@ collapsed property-filter panel:
 
 ![BitMako search UI](docs/screenshots/search-ui.png)
 
-**Live pruning readout and results** — after a query, the UI's hero element
-is the number of compounds BMW actually evaluated against the full corpus
-size (here: 51 of 1.36 billion), followed by the ranked results table with
-Tanimoto scores, an inline peak-bar per result, and resolved SMILES/property
-columns when `--lance` is attached:
+**Search Statistics dashboard and results** — after a query, a compact
+dashboard summarizes it (molecules searched against the full corpus,
+matches, execution time, fingerprint type, average/maximum similarity),
+followed by the ranked results table with Tanimoto scores, an inline
+peak-bar per result, and resolved SMILES/property columns when `--lance`
+is attached:
 
-![Live pruning readout and results table](docs/screenshots/pruning-readout.png)
+![Search Statistics dashboard and results table](docs/screenshots/pruning-readout.png)
 
 **Similarity Analysis panel, expanded** — clicking "Analysis" on any result
 reveals the bit-level breakdown behind its score and a generated explanation
@@ -148,6 +150,11 @@ of the match, without cluttering the default table view:
   the actual fingerprint comparison — not canned text. Costs one extra mmap
   read per *returned* result, not per candidate evaluated, so it doesn't
   touch WAND's pruning loop or its performance.
+- **Search Statistics dashboard** — a compact strip above the results
+  showing molecules searched, match count, execution time, fingerprint type,
+  and average/maximum similarity for the query that just ran. Built almost
+  entirely from data the API was already returning; no charts, no history,
+  just the current query's own numbers.
 - **Memory-bounded index construction** — multi-pass builder trades peak RAM
   against pass count, so a 70 GB index can be built without loading it whole.
 - **Verified-exact streaming search** — the skip-cursor implementation is
@@ -306,6 +313,50 @@ stays scannable), and the single-query `search` CLI command. Deliberately
 explanation doesn't fit a tabular bulk-export format, and anyone scripting
 against batch results can call the same `analyze`/`analyze_results` functions
 directly from the library.
+
+## Search Statistics
+
+A compact dashboard sits above the results table in the web UI, giving a
+scan-at-a-glance summary of the query that just ran:
+
+| Field | Source |
+|---|---|
+| Molecules searched | `docs_evaluated` — already returned by `search_with_stats` (WAND's own pruning counter) |
+| Matches | `results.length` — the response's own result array |
+| Execution time | New: wall-clock time around the `search_with_stats` call, in `handle_search` |
+| Fingerprint type | New: a static constant (`FINGERPRINT_KIND` in `etl::fingerprint`), surfaced via `GET /health` |
+| Average similarity | Computed client-side from `results[].score` — already on every result |
+| Maximum similarity | Computed client-side from `results[].score` — already on every result |
+
+Four of the six fields are values the API was already returning for other
+reasons (the pruning-ratio hero readout and the results themselves); only
+**execution time** and **fingerprint type** required new fields, and both are
+cheap, single-value additions with no bearing on the search path itself —
+timing wraps the existing call from the outside, and the fingerprint type is
+a compile-time constant, not something computed per query.
+
+**Where it lives:** the dashboard replaces what used to be a single
+standalone "N of 1.36B evaluated" hero readout — that fact is still here
+(now the dashboard's lead, amber-highlighted cell, "Molecules Searched"),
+just folded into one compact strip with the other five stats instead of
+occupying its own section. No second "stats area" was added above the
+results; the existing one grew from one fact to six. All of the layout and
+number-formatting logic lives in `static/index.html`'s existing `<script>`
+block, styled with the same label/value visual pattern already established
+for the [Similarity Analysis](#similarity-analysis) panel (uppercase mono
+labels, bold mono values) — no new colors, fonts, or components.
+
+**Why this doesn't affect search performance:** `search_time_ms` is measured
+with `std::time::Instant` wrapped *around* the existing `search_with_stats`
+call — it observes the search, it doesn't participate in it. The average/max
+similarity are `Array.reduce`-style passes over the already-fetched top-k
+results in the browser, not a second query. Nothing here touches
+`BmwEngine`, the posting lists, or adds a request to the server.
+
+**Deliberately excluded:** no charts, sparklines, or historical/trend views —
+just the current query's own numbers, matching the existing UI's restrained,
+instrument-readout aesthetic rather than turning the page into an analytics
+dashboard.
 
 ## Design Decisions
 
@@ -522,17 +573,22 @@ warm in the running server. Built on Axum over a multi-thread Tokio runtime.
 Serves the embedded single-page search UI (`static/index.html`, baked into
 the binary via `include_str!` — no separate build step or deploy artifact).
 Property-filter inputs auto-disable when `/health` reports no prop-store
-attached. Each search surfaces the number of compounds BMW actually
-evaluated against the corpus size — the pruning ratio is the one fact the
-UI is built to make visible. Each result row also carries a collapsed
-"Analysis" toggle exposing its [Similarity Analysis](#similarity-analysis)
-panel — the bit-level breakdown and generated explanation — without
-cluttering the default table view.
+attached. A compact [Search Statistics](#search-statistics) dashboard sits
+above the results table for every query. Each result row also carries a
+collapsed "Analysis" toggle exposing its
+[Similarity Analysis](#similarity-analysis) panel — the bit-level breakdown
+and generated explanation — without cluttering the default table view.
 
 ### `GET /health`
 
 ```json
-{ "status": "ok", "compounds": 1364304490, "lance_attached": true, "prop_store_attached": true }
+{
+  "status": "ok",
+  "compounds": 1364304490,
+  "lance_attached": true,
+  "prop_store_attached": true,
+  "fingerprint_type": "ECFP4 (1024-bit Morgan)"
+}
 ```
 
 ### `POST /search`
@@ -581,7 +637,8 @@ cluttering the default table view.
     }
   ],
   "docs_evaluated": 45,
-  "eval_fraction_pct": 0.0000033
+  "eval_fraction_pct": 0.0000033,
+  "search_time_ms": 142.3
 }
 ```
 
@@ -591,7 +648,10 @@ cluttering the default table view.
 `shared_bits`/`query_unique_bits`/`candidate_unique_bits`/`explanation` are
 the [Similarity Analysis](#similarity-analysis) panel fields — always
 present regardless of `--lance`, since they're derived purely from the
-fingerprints.
+fingerprints. `search_time_ms` is wall-clock time around the WAND search
+itself (see [Search Statistics](#search-statistics)) — match count and
+average/maximum similarity aren't separate fields since they're one pass
+over `results` away for any caller.
 
 **Error responses** — HTTP 400 with a JSON body, for: out-of-range
 threshold, unparseable SMILES, `top_k=0`, or property filters requested

@@ -201,32 +201,62 @@
   }
   #empty-box.show { display: block; }
 
-  /* ---------- hero readout ---------- */
+  /* ---------- search statistics dashboard ---------- */
 
-  #hero {
+  #stats-dashboard {
     display: none;
-    text-align: center;
-    padding: 40px 0 36px;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 24px 40px;
+    padding: 28px 0 24px;
     border-bottom: 1px solid var(--rule);
     margin-top: 40px;
   }
-  #hero.show { display: block; }
+  #stats-dashboard.show { display: flex; }
 
-  #hero-count {
+  .stat-cell { min-width: 96px; }
+
+  .stat-label {
+    display: block;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    margin-bottom: 6px;
+  }
+
+  .stat-value {
+    display: block;
     font-family: var(--mono);
     font-weight: 700;
-    font-size: clamp(32px, 7vw, 56px);
-    color: var(--amber);
-    line-height: 1;
+    font-size: 22px;
+    color: var(--ink);
+    line-height: 1.15;
   }
 
-  #hero-caption {
-    margin-top: 10px;
-    font-size: 13px;
+  .stat-value.text { font-size: 14px; font-weight: 600; }
+
+  .stat-caption {
+    display: block;
+    margin-top: 3px;
+    font-family: var(--sans);
+    font-size: 11px;
     color: var(--ink-muted);
   }
+  .stat-caption .frac { font-family: var(--mono); color: var(--ink); }
 
-  #hero-caption .frac { font-family: var(--mono); color: var(--ink); }
+  /* The one stat worth making dramatic: how much of a billion-scale corpus
+     WAND actually had to touch. Same amber-hero treatment the old standalone
+     readout used, now folded into the compact dashboard as its lead cell. */
+  .stat-cell--hero {
+    min-width: 220px;
+  }
+  .stat-cell--hero .stat-value {
+    color: var(--amber);
+    font-size: clamp(26px, 5vw, 38px);
+  }
 
   /* ---------- results table ---------- */
 
@@ -412,9 +442,32 @@
   <div id="error-box" role="alert"></div>
   <div id="empty-box"></div>
 
-  <section id="hero">
-    <div id="hero-count">—</div>
-    <div id="hero-caption"></div>
+  <section id="stats-dashboard" aria-label="Search statistics">
+    <div class="stat-cell stat-cell--hero">
+      <span class="stat-label">Molecules Searched</span>
+      <span class="stat-value" id="stat-searched">—</span>
+      <span class="stat-caption" id="stat-searched-caption"></span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Matches</span>
+      <span class="stat-value" id="stat-matches">—</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Execution Time</span>
+      <span class="stat-value" id="stat-time">—</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Avg. Similarity</span>
+      <span class="stat-value" id="stat-avg">—</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Max Similarity</span>
+      <span class="stat-value" id="stat-max">—</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Fingerprint</span>
+      <span class="stat-value text" id="stat-fp">—</span>
+    </div>
   </section>
 
   <div id="results-wrap"></div>
@@ -429,7 +482,7 @@
 (function () {
   "use strict";
 
-  var state = { lanceAttached: false, propStoreAttached: false, corpusSize: null };
+  var state = { lanceAttached: false, propStoreAttached: false, corpusSize: null, fingerprintType: null };
 
   var els = {
     corpusCount: document.getElementById('corpus-count'),
@@ -445,9 +498,14 @@
     searchBtn: document.getElementById('search-btn'),
     errorBox: document.getElementById('error-box'),
     emptyBox: document.getElementById('empty-box'),
-    hero: document.getElementById('hero'),
-    heroCount: document.getElementById('hero-count'),
-    heroCaption: document.getElementById('hero-caption'),
+    statsDashboard: document.getElementById('stats-dashboard'),
+    statSearched: document.getElementById('stat-searched'),
+    statSearchedCaption: document.getElementById('stat-searched-caption'),
+    statMatches: document.getElementById('stat-matches'),
+    statTime: document.getElementById('stat-time'),
+    statAvg: document.getElementById('stat-avg'),
+    statMax: document.getElementById('stat-max'),
+    statFp: document.getElementById('stat-fp'),
     resultsWrap: document.getElementById('results-wrap'),
   };
 
@@ -459,6 +517,23 @@
     var s = pct.toFixed(decimals);
     s = s.replace(/0+$/, '').replace(/\.$/, '');
     return s + '%';
+  }
+
+  function fmtDuration(ms) {
+    if (ms < 1000) return ms.toFixed(1) + ' ms';
+    return (ms / 1000).toFixed(2) + ' s';
+  }
+
+  // Average/max similarity: derived from the scores already on each result —
+  // no extra request, just a pass over data the response already carries.
+  function scoreSummary(results) {
+    if (results.length === 0) return null;
+    var sum = 0, max = -Infinity;
+    for (var i = 0; i < results.length; i++) {
+      sum += results[i].score;
+      if (results[i].score > max) max = results[i].score;
+    }
+    return { avg: sum / results.length, max: max };
   }
 
   function showError(msg) {
@@ -484,6 +559,7 @@
       state.lanceAttached = !!h.lance_attached;
       state.propStoreAttached = !!h.prop_store_attached;
       state.corpusSize = h.compounds;
+      state.fingerprintType = h.fingerprint_type || null;
       els.corpusCount.innerHTML = '<strong>' + fmtInt(h.compounds) + '</strong> compounds indexed';
       if (!state.propStoreAttached) {
         els.mwMax.disabled = true;
@@ -655,7 +731,7 @@
     clearError();
     clearEmpty();
     els.resultsWrap.innerHTML = '';
-    els.hero.classList.remove('show');
+    els.statsDashboard.classList.remove('show');
 
     els.searchBtn.disabled = true;
     els.searchBtn.textContent = 'Searching…';
@@ -674,11 +750,21 @@
           return;
         }
         var resp = res.data;
-        els.heroCount.textContent = fmtInt(resp.docs_evaluated) + ' of ' +
-          (state.corpusSize != null ? fmtInt(state.corpusSize) : '?') + ' evaluated';
-        els.heroCaption.innerHTML = '<span class="frac">' + fmtPct(resp.eval_fraction_pct) +
-          '</span> of the indexed corpus — query popcount ' + resp.query_pop + ' bits';
-        els.hero.classList.add('show');
+
+        // Search Statistics dashboard — every field here comes from data the
+        // response already carries (docs_evaluated, results, search_time_ms)
+        // or from /health (fingerprint_type); nothing here re-queries the engine.
+        els.statSearched.textContent = fmtInt(resp.docs_evaluated);
+        els.statSearchedCaption.innerHTML = 'of ' +
+          (state.corpusSize != null ? fmtInt(state.corpusSize) : '?') +
+          ' indexed — <span class="frac">' + fmtPct(resp.eval_fraction_pct) + '</span> evaluated';
+        els.statMatches.textContent = fmtInt(resp.results.length);
+        els.statTime.textContent = fmtDuration(resp.search_time_ms);
+        var scores = scoreSummary(resp.results);
+        els.statAvg.textContent = scores ? scores.avg.toFixed(4) : '—';
+        els.statMax.textContent = scores ? scores.max.toFixed(4) : '—';
+        els.statFp.textContent = state.fingerprintType || '—';
+        els.statsDashboard.classList.add('show');
 
         if (resp.results.length === 0) {
           els.emptyBox.textContent = 'No hits above threshold ' + els.threshold.value +

@@ -9,6 +9,12 @@ use crc32fast::Hasher as Crc32Hasher;
 pub const FP_WORDS: usize = 16;
 pub const FP_BITS: usize = FP_WORDS * 64; // 1024
 
+/// Human-readable identifier for the fingerprint scheme every compound in the
+/// corpus was encoded with. Single source of truth for display purposes (e.g.
+/// the HTTP API's `/health` endpoint) — if BitMako ever supports more than one
+/// fingerprint type, this is the one place that label needs to change.
+pub const FINGERPRINT_KIND: &str = "ECFP4 (1024-bit Morgan)";
+
 pub type Fingerprint = [u64; FP_WORDS];
 
 /// Atomic numbers for organic subset atoms.
