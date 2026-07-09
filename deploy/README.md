@@ -47,6 +47,27 @@ cargo build --release
 Visit `http://localhost:8080/` — confirm search works and the amber demo
 banner shows up.
 
+**Known characteristic of a `--limit`-only (no `--stride`) subset:** it's the
+*first* N rows of the catalog, not a spread-out sample — confirmed against
+the actual 20M build that this means some generic queries (plain aspirin,
+benzene) return few or zero hits at realistic thresholds, since this slice
+happens to be a narrow batch of the catalog rather than the full chemical
+diversity. This isn't a bug (verified via a self-match search: a SMILES known
+to be in the subset returns a correct `score=1.0` exact match, and the WAND
+vs. brute-force correctness tests in `tests/search_correctness.rs` pass
+independent of which compounds are in the corpus). For a demo query that
+reliably returns a rich, populated result set in *this* 20M build, try:
+
+```
+CC(=O)OCCC(=O)NC1=CC(C)=NO1
+```
+
+(10 hits from score 1.0 down to 0.6 at threshold 0.5 — already reflected in
+the `--demo-notice` text in `bitmako-demo.service`.) If you rebuild the subset
+with different `--limit`/`--stride` values, re-derive a good example query the
+same way: run a few searches locally and pick one with a populated neighborhood
+before shipping.
+
 ## 2. Create the free Oracle Cloud VM
 
 1. Sign up at [oracle.com/cloud/free](https://www.oracle.com/cloud/free/) (needs a card for identity verification, but the Always Free tier is never billed unless you explicitly upgrade — no auto-charge after a trial).
