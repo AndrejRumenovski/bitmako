@@ -1,0 +1,29 @@
+[Unit]
+Description=BitMako similarity search demo
+After=network.target
+
+[Service]
+Type=simple
+User=bitmako
+Group=bitmako
+WorkingDirectory=/opt/bitmako
+ExecStart=/opt/bitmako/bin/bitmako serve \
+  --index /opt/bitmako/data/demo/compounds.bitmako \
+  --skip /opt/bitmako/data/demo/compounds.skip \
+  --fp-store /opt/bitmako/data/demo/compounds.fp \
+  --prop-store /opt/bitmako/data/demo/compounds.prop \
+  --lance /opt/bitmako/data/demo/compounds.lance \
+  --bind 127.0.0.1 \
+  --port 8080 \
+  --demo-notice "Demo instance — searching a subset of the full 1.36B-compound corpus. Source: github.com/AndrejRumenovski/bitmako"
+Restart=on-failure
+RestartSec=5
+# Bind only to localhost; nginx (deploy/nginx-bitmako.conf) is the public-facing
+# TLS-terminating reverse proxy — the app itself is never exposed directly.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/bitmako
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
