@@ -1,15 +1,19 @@
 # Deploying a public BitMako demo
 
-This is the step-by-step for building a small subset of the full 1.36B-compound
-corpus and hosting it as a public, clickable demo. Steps 1–2 run on your
-workstation (where the real `data/` files already live); steps 3+ run on a VPS.
+Step-by-step for building a 20M-compound subset of the full 1.36B corpus and
+hosting it as a public, clickable demo at **bitmako.duckdns.org**, at $0 cost.
+Steps 1 runs on your workstation (where the real `data/` files live); steps
+2+ run on a free Oracle Cloud "Always Free" VM.
 
-## 1. Pick a subset size and build it (on your workstation)
+Stack: **Oracle Cloud Free Tier** (Ampere A1, permanently free — 4 OCPU/24GB
+RAM/200GB disk, comfortably fits the ~4.5GB subset) + **DuckDNS** (free
+dynamic DNS, gives you `bitmako.duckdns.org` pointing at the VM) + **nginx +
+certbot** for real TLS on that free subdomain.
 
-20M compounds is a good default: representative, builds in minutes, and the
-resulting files (~1 GB index, ~2.5 GB fp-store, ~400 MB prop-store, ~500 MB
-skip index) fit comfortably on a small VPS disk. Adjust `--limit` for a
-bigger/smaller demo.
+## 1. Build the 20M-compound subset (on your workstation)
+
+Resulting files: ~1 GB index, ~2.5 GB fp-store, ~400 MB prop-store, ~500 MB
+skip index — about 4.5 GB total.
 
 ```powershell
 cargo build --release
@@ -43,33 +47,43 @@ cargo build --release
 Visit `http://localhost:8080/` — confirm search works and the amber demo
 banner shows up.
 
-## 2. Pick hosting
+## 2. Create the free Oracle Cloud VM
 
-Recommended: a small VPS (Hetzner CX22 ~€4/mo, or a DigitalOcean/Linode
-$6/mo droplet) running Ubuntu 22.04+. Rather than cross-compiling from
-Windows (fragile with Lance's native/protoc dependencies), **build the release
-binary on the VPS itself** — a one-time ~15–25 min build, same as on your
-workstation.
+1. Sign up at [oracle.com/cloud/free](https://www.oracle.com/cloud/free/) (needs a card for identity verification, but the Always Free tier is never billed unless you explicitly upgrade — no auto-charge after a trial).
+2. **Compute → Instances → Create instance.**
+   - Image: **Ubuntu 22.04** (or the latest LTS offered).
+   - Shape: click "Change shape" → **Ampere (VM.Standard.A1.Flex)** → this is the *Always Free* shape. Set 4 OCPUs / 24 GB RAM (the free-tier maximum).
+   - Boot volume: bump to 200 GB (still free-tier eligible).
+   - Add your SSH public key (generate one with `ssh-keygen` if you don't have one).
+3. **Note the instance's public IP** once it's running.
+4. **Open the firewall** — Oracle blocks ports by default at the network level, separate from the OS firewall:
+   - Go to the instance's subnet → **Security Lists** → default security list → **Add Ingress Rules**: allow TCP 80 and TCP 443 from `0.0.0.0/0`.
+   - On the VM itself, Ubuntu's `iptables`/`netfilter-persistent` also blocks by default on Oracle images — the commands in step 3 below open it there too.
 
-## 3. Provision the VPS
+## 3. Provision the VM
 
 ```bash
-ssh root@YOUR_VPS_IP
+ssh ubuntu@YOUR_VM_IP
 
-apt update && apt install -y build-essential pkg-config libssl-dev \
+sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev \
   protobuf-compiler git nginx certbot python3-certbot-nginx
+
+# Oracle's Ubuntu images firewall everything by default at the OS level too.
+sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+sudo netfilter-persistent save 2>/dev/null || true
 
 curl https://sh.rustup.rs -sSf | sh -s -- -y
 source "$HOME/.cargo/env"
 
-useradd -m -s /usr/sbin/nologin bitmako
-mkdir -p /opt/bitmako/{bin,data/demo}
-chown -R bitmako:bitmako /opt/bitmako
+sudo useradd -m -s /usr/sbin/nologin bitmako
+sudo mkdir -p /opt/bitmako/{bin,data/demo}
+sudo chown -R bitmako:bitmako /opt/bitmako
 
 git clone https://github.com/AndrejRumenovski/bitmako.git ~/bitmako-src
 cd ~/bitmako-src
 cargo build --release
-cp target/release/bitmako /opt/bitmako/bin/
+sudo cp target/release/bitmako /opt/bitmako/bin/
 ```
 
 ## 4. Copy the subset data up
@@ -77,36 +91,56 @@ cp target/release/bitmako /opt/bitmako/bin/
 From your workstation:
 
 ```powershell
-scp -r data\demo\* root@YOUR_VPS_IP:/opt/bitmako/data/demo/
+scp -r data\demo\* ubuntu@YOUR_VM_IP:/tmp/bitmako-demo-data/
 ```
 
-Then on the VPS: `chown -R bitmako:bitmako /opt/bitmako/data`
+Then on the VM:
+
+```bash
+sudo mv /tmp/bitmako-demo-data/* /opt/bitmako/data/demo/
+sudo chown -R bitmako:bitmako /opt/bitmako/data
+```
 
 ## 5. Install the systemd service
 
 ```bash
-cp ~/bitmako-src/deploy/bitmako-demo.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now bitmako-demo
-systemctl status bitmako-demo   # should show "active (running)"
-curl http://127.0.0.1:8080/health   # sanity check before exposing publicly
+sudo cp ~/bitmako-src/deploy/bitmako-demo.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now bitmako-demo
+sudo systemctl status bitmako-demo   # should show "active (running)"
+curl http://127.0.0.1:8080/health    # sanity check before exposing publicly
 ```
 
-## 6. Point DNS and put nginx + TLS in front
+## 6. Set up DuckDNS for bitmako.duckdns.org
 
-Add an `A` record for your chosen subdomain (e.g. `demo.yourdomain.com`)
-pointing at the VPS's IP in your domain registrar's DNS panel.
+1. Go to [duckdns.org](https://www.duckdns.org/), sign in (GitHub/Google login), and claim the subdomain **bitmako** — this gives you `bitmako.duckdns.org` pointing wherever you tell it, for free, forever.
+2. On the DuckDNS dashboard, set the IP field to your Oracle VM's public IP (or use their update URL — see below to automate it).
+3. Keep it pointed at the VM automatically (the VM's IP can change on reboot depending on your Oracle networking setup — a reserved/static public IP avoids this, which Oracle's free tier supports; assign one under **Networking → Reserved Public IPs**). If you don't reserve one, set up a cron job on the VM to keep DuckDNS updated:
 
 ```bash
-sed 's/DEMO_DOMAIN/demo.yourdomain.com/' ~/bitmako-src/deploy/nginx-bitmako.conf \
-  > /etc/nginx/sites-available/bitmako-demo
-ln -s /etc/nginx/sites-available/bitmako-demo /etc/nginx/sites-enabled/
-nginx -t && systemctl reload nginx
-
-certbot --nginx -d demo.yourdomain.com   # provisions + auto-renews TLS
+mkdir -p ~/duckdns
+cat > ~/duckdns/update.sh <<'EOF'
+echo url="https://www.duckdns.org/update?domains=bitmako&token=YOUR_DUCKDNS_TOKEN&ip=" | curl -k -o ~/duckdns/duck.log -K -
+EOF
+chmod +x ~/duckdns/update.sh
+(crontab -l 2>/dev/null; echo "*/5 * * * * ~/duckdns/update.sh >/dev/null 2>&1") | crontab -
 ```
 
-Visit `https://demo.yourdomain.com/` — you should see the live search UI.
+(Get `YOUR_DUCKDNS_TOKEN` from the DuckDNS dashboard.)
+
+## 7. Put nginx + TLS in front
+
+`deploy/nginx-bitmako.conf` is already configured for `bitmako.duckdns.org`:
+
+```bash
+sudo cp ~/bitmako-src/deploy/nginx-bitmako.conf /etc/nginx/sites-available/bitmako-demo
+sudo ln -s /etc/nginx/sites-available/bitmako-demo /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+sudo certbot --nginx -d bitmako.duckdns.org   # provisions + auto-renews TLS
+```
+
+Visit **https://bitmako.duckdns.org/** — you should see the live search UI.
 
 ## Note on rate limiting in this topology
 
@@ -114,7 +148,7 @@ BitMako's own per-IP limiter (`src/api.rs`) identifies clients by TCP peer
 address. Once nginx is the reverse proxy, every request's peer address is
 nginx itself (`127.0.0.1`) — so BitMako's limiter becomes one **shared**
 budget across all visitors combined (30 req/min total), not 30-per-visitor.
-The nginx config above (`limit_req_zone $binary_remote_addr`) is what actually
+The nginx config (`limit_req_zone $binary_remote_addr`) is what actually
 enforces per-visitor limits in this deployment; it sees the real client IP.
 Both layers still help (nginx = per-visitor, BitMako = a global ceiling), just
 know they're not doing the same job.
@@ -123,6 +157,6 @@ know they're not doing the same job.
 
 ```bash
 cd ~/bitmako-src && git pull && cargo build --release
-cp target/release/bitmako /opt/bitmako/bin/
-systemctl restart bitmako-demo
+sudo cp target/release/bitmako /opt/bitmako/bin/
+sudo systemctl restart bitmako-demo
 ```
