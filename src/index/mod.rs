@@ -81,6 +81,12 @@ impl IndexReader {
 
         // Offset table: num_bits × u64, starting at byte 20.
         let offsets_start = 20usize;
+        let offsets_end = offsets_start + num_bits as usize * 8;
+        if offsets_end > data.len() {
+            return Err(BitMakoError::IndexBuild(
+                "index truncated: offset table exceeds file length".into(),
+            ));
+        }
         let mut offsets = vec![0u64; num_bits as usize];
         for (i, off) in offsets.iter_mut().enumerate() {
             let p = offsets_start + i * 8;
@@ -144,5 +150,134 @@ impl IndexReader {
             self.mmap.len()
         };
         &self.mmap[start..end]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::etl::fingerprint::compute_morgan_fp;
+    use crate::index::builder::IndexBuilder;
+
+    fn write_and_open(smiles: &[&str]) -> (IndexReader, tempfile::NamedTempFile) {
+        let mut builder = IndexBuilder::new();
+        for (i, s) in smiles.iter().enumerate() {
+            builder.add_compound(i as u32, &compute_morgan_fp(s));
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        builder.write_index(tmp.path()).unwrap();
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        (reader, tmp)
+    }
+
+    #[test]
+    fn open_reports_correct_header_fields() {
+        let (reader, _tmp) = write_and_open(&["CCO", "c1ccccc1", "CNC(=O)c1ccccc1"]);
+        assert_eq!(reader.num_compounds, 3);
+        assert_eq!(reader.num_bits, crate::etl::fingerprint::FP_BITS as u32);
+    }
+
+    #[test]
+    fn compound_pop_matches_actual_fingerprint_popcount() {
+        let smiles = ["CCO", "c1ccccc1", "CC(=O)Oc1ccccc1C(=O)O"];
+        let (reader, _tmp) = write_and_open(&smiles);
+        for (i, s) in smiles.iter().enumerate() {
+            let fp = compute_morgan_fp(s);
+            let expected_pop = crate::etl::fingerprint::fp_popcount(&fp) as u8;
+            assert_eq!(reader.compound_pop(i as u32), expected_pop);
+        }
+    }
+
+    #[test]
+    fn compound_pop_out_of_range_returns_zero() {
+        let (reader, _tmp) = write_and_open(&["CCO"]);
+        assert_eq!(reader.compound_pop(9999), 0);
+    }
+
+    #[test]
+    fn decode_posting_list_contains_every_doc_with_that_bit_set() {
+        let smiles = ["CCO", "CCCO", "c1ccccc1", "CN"];
+        let (reader, _tmp) = write_and_open(&smiles);
+        let fps: Vec<_> = smiles.iter().map(|s| compute_morgan_fp(s)).collect();
+
+        // Pick a bit that's actually set in at least one fingerprint and verify
+        // the decoded posting list is exactly the set of docs with that bit on.
+        for bit in 0..crate::etl::fingerprint::FP_BITS {
+            let word = bit / 64;
+            let b = bit % 64;
+            let expected: Vec<u32> = fps
+                .iter()
+                .enumerate()
+                .filter(|(_, fp)| (fp[word] >> b) & 1 == 1)
+                .map(|(i, _)| i as u32)
+                .collect();
+            if expected.is_empty() {
+                continue;
+            }
+            let decoded = reader.decode_posting_list(bit).unwrap();
+            assert_eq!(decoded.doc_ids, expected, "mismatch for bit {bit}");
+        }
+    }
+
+    #[test]
+    fn open_rejects_bad_magic_bytes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"NOTAMAGIC00000000000").unwrap();
+        assert!(IndexReader::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn open_rejects_unsupported_version() {
+        let mut data = Vec::new();
+        data.extend_from_slice(INDEX_MAGIC);
+        data.extend_from_slice(&99u32.to_le_bytes()); // version 99 unsupported
+        data.extend_from_slice(&0u32.to_le_bytes()); // num_compounds
+        data.extend_from_slice(&0u32.to_le_bytes()); // num_bits
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
+        assert!(IndexReader::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn open_accepts_legacy_version_1_header() {
+        // Historical bug: cmd_build_index once wrote version byte 1 while
+        // already using the 8-byte-offset v2 layout. IndexReader must keep
+        // accepting real files built with that header — see INDEX_VERSION's
+        // doc comment. Build a normal index then patch the version field.
+        let mut builder = IndexBuilder::new();
+        builder.add_compound(0, &compute_morgan_fp("CCO"));
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        builder.write_index(tmp.path()).unwrap();
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(tmp.path(), &bytes).unwrap();
+
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        assert_eq!(reader.num_compounds, 1);
+    }
+
+    #[test]
+    fn open_rejects_truncated_header() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // Magic bytes only, well under the 20-byte minimum header.
+        std::fs::write(tmp.path(), INDEX_MAGIC).unwrap();
+        assert!(IndexReader::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn open_rejects_offset_table_exceeding_file_length() {
+        // A header claiming a huge num_bits (so its offsets table alone would
+        // exceed the tiny file we actually write) must error, not panic on
+        // out-of-bounds slicing.
+        let mut data = Vec::new();
+        data.extend_from_slice(INDEX_MAGIC);
+        data.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes()); // num_compounds = 1
+        data.extend_from_slice(&1024u32.to_le_bytes()); // num_bits = 1024
+        // Deliberately omit the offsets table / pops / postings sections.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
+        assert!(IndexReader::open(tmp.path()).is_err());
     }
 }

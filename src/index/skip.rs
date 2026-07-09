@@ -198,3 +198,100 @@ impl<'a> SkipSlice<'a> {
         lo.saturating_sub(1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::etl::fingerprint::compute_morgan_fp;
+    use crate::index::builder::IndexBuilder;
+
+    fn build_index(smiles: &[&str]) -> IndexReader {
+        let mut builder = IndexBuilder::new();
+        for (i, s) in smiles.iter().enumerate() {
+            builder.add_compound(i as u32, &compute_morgan_fp(s));
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        builder.write_index(tmp.path()).unwrap();
+        // Leak the tempfile's path lifetime by re-opening: IndexReader mmaps
+        // its own handle, so it's fine for `tmp` to drop after this returns.
+        IndexReader::open(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn build_in_memory_roundtrips_and_reports_num_bits() {
+        let index = build_index(&["CCO", "c1ccccc1", "CNC(=O)c1ccccc1"]);
+        let skip = SkipIndex::build_in_memory(&index).unwrap();
+        assert_eq!(skip.num_bits(), index.num_bits);
+    }
+
+    #[test]
+    fn entries_num_blocks_matches_posting_list_size() {
+        // A posting list with > BLOCK_SIZE (128) docs spans multiple blocks.
+        let smiles: Vec<String> = (0..300).map(|_| "CCO".to_string()).collect();
+        let smiles_refs: Vec<&str> = smiles.iter().map(|s| s.as_str()).collect();
+        let index = build_index(&smiles_refs);
+        let skip = SkipIndex::build_in_memory(&index).unwrap();
+
+        // Every active bit in "CCO"'s fingerprint has a posting list of 300 docs.
+        let active_bits = crate::search::query::SimilarityQuery::new(
+            compute_morgan_fp("CCO"),
+            0.0,
+            1,
+        )
+        .active_bits();
+        for bit in active_bits {
+            let entries = skip.entries(bit);
+            assert_eq!(entries.num_blocks(), 300usize.div_ceil(128));
+            assert!(!entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_posting_list_entries_are_empty() {
+        // Bit 1023 is (almost certainly) never set by any real fingerprint in
+        // this tiny corpus, so its posting list should have zero blocks.
+        let index = build_index(&["CCO", "c1ccccc1"]);
+        let skip = SkipIndex::build_in_memory(&index).unwrap();
+        let entries = skip.entries(1023);
+        assert_eq!(entries.num_blocks(), 0);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn block_for_finds_the_covering_block() {
+        // Synthetic skip slice bytes: 3 blocks with entering bases 0, 50, 120.
+        let mut data = Vec::new();
+        for &(base, off) in &[(0u32, 0u64), (50, 100), (120, 200)] {
+            data.extend_from_slice(&base.to_le_bytes());
+            data.extend_from_slice(&off.to_le_bytes());
+        }
+        let slice = SkipSlice { data: &data, num_blocks: 3 };
+
+        // Targets within (base_i, base_{i+1}] should resolve to block i.
+        assert_eq!(slice.block_for(1), 0);
+        assert_eq!(slice.block_for(50), 0); // base(1)=50 is not < 50, so block 0
+        assert_eq!(slice.block_for(51), 1);
+        assert_eq!(slice.block_for(120), 1);
+        assert_eq!(slice.block_for(121), 2);
+        assert_eq!(slice.block_for(0), 0); // clamped to block 0
+    }
+
+    #[test]
+    fn open_rejects_bad_magic() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"NOTASKIP12345678").unwrap();
+        assert!(SkipIndex::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn open_rejects_truncated_directory() {
+        // Valid magic + version + num_bits=1000, but no directory bytes follow.
+        let mut data = Vec::new();
+        data.extend_from_slice(SKIP_MAGIC);
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1000u32.to_le_bytes());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &data).unwrap();
+        assert!(SkipIndex::open(tmp.path()).is_err());
+    }
+}

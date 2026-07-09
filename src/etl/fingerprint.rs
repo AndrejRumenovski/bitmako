@@ -438,4 +438,106 @@ mod tests {
         let fp2 = compute_morgan_fp("CNC");
         assert_ne!(fp1, fp2);
     }
+
+    #[test]
+    fn test_ring_closure_single_digit() {
+        // Benzene: a 6-membered aromatic ring closed with digit "1".
+        let fp = compute_morgan_fp("c1ccccc1");
+        assert!(fp_popcount(&fp) > 0);
+    }
+
+    #[test]
+    fn test_ring_closure_two_digit_percent_notation() {
+        // A ring closure using %NN two-digit notation should parse identically
+        // to the single-digit form for a ring number below 10.
+        let single = compute_morgan_fp("C1CCCCCCCCCC1");
+        let double = compute_morgan_fp("C%10CCCCCCCCCC%10");
+        assert_eq!(single, double);
+        assert!(fp_popcount(&single) > 0);
+    }
+
+    #[test]
+    fn test_fused_ring_system() {
+        // Naphthalene: two fused aromatic rings, ring closures 1 and 2.
+        let fp = compute_morgan_fp("c1ccc2ccccc2c1");
+        assert!(fp_popcount(&fp) > 0);
+    }
+
+    #[test]
+    fn test_branches_parse_without_panicking() {
+        // Nested branches: ibuprofen.
+        let fp = compute_morgan_fp("CC(C)Cc1ccc(cc1)C(C)C(=O)O");
+        assert!(fp_popcount(&fp) > 0);
+    }
+
+    #[test]
+    fn test_bracket_atom_with_charge() {
+        // Ammonium cation: bracket atom with explicit H count and charge.
+        let fp = compute_morgan_fp("[NH4+]");
+        assert!(fp_popcount(&fp) > 0);
+    }
+
+    #[test]
+    fn test_bracket_atom_with_negative_charge() {
+        let fp = compute_morgan_fp("[O-]C(=O)C");
+        assert!(fp_popcount(&fp) > 0);
+    }
+
+    #[test]
+    fn test_bracket_atom_stereo_marker_ignored() {
+        // Stereo descriptors inside brackets ([C@H], [C@@H]) shouldn't affect
+        // parsing — only the element symbol / H-count / charge matter here.
+        let plain = compute_morgan_fp("C(N)C(=O)O");
+        let stereo = compute_morgan_fp("[C@H](N)C(=O)O");
+        // Both must at least parse to something non-empty; exact bit-for-bit
+        // equality isn't required since the invariant hash includes h_count,
+        // which differs between an implicit-H organic atom and the bracket form.
+        assert!(fp_popcount(&plain) > 0);
+        assert!(fp_popcount(&stereo) > 0);
+    }
+
+    #[test]
+    fn test_explicit_bonds_double_triple() {
+        let double_bond = compute_morgan_fp("C=C");
+        let triple_bond = compute_morgan_fp("C#C");
+        let single_bond = compute_morgan_fp("CC");
+        assert!(fp_popcount(&double_bond) > 0);
+        assert!(fp_popcount(&triple_bond) > 0);
+        // Different bond orders between otherwise-identical atoms must hash
+        // differently — bond order feeds the neighbor-environment hash.
+        assert_ne!(double_bond, single_bond);
+        assert_ne!(triple_bond, single_bond);
+    }
+
+    #[test]
+    fn test_malformed_smiles_does_not_panic() {
+        // Unclosed bracket, dangling ring closure, empty branches, garbage
+        // characters — none of these are valid SMILES, but the parser must
+        // degrade gracefully (empty/best-effort fingerprint), never panic.
+        let malformed = [
+            "[", "C(", "C)", "1", "C11", "%", "C%1", "()", "***", "C[",
+            "[Xx]", "C%", "[NH",
+        ];
+        for s in malformed {
+            let fp = compute_morgan_fp(s);
+            // No assertion on content — just that this returned instead of panicking.
+            let _ = fp_popcount(&fp);
+        }
+    }
+
+    #[test]
+    fn test_unclosed_bracket_returns_zero_fingerprint() {
+        // parse_smiles returns Err for an unclosed '[', and compute_morgan_fp
+        // maps any parse error to an all-zero fingerprint rather than failing.
+        let fp = compute_morgan_fp("C[NH2");
+        assert_eq!(fp, [0u64; 16]);
+    }
+
+    #[test]
+    fn test_whitespace_and_unknown_chars_are_skipped() {
+        // Stray characters (stereo bond slashes, whitespace) fall through the
+        // parser's catch-all arm rather than erroring.
+        let fp = compute_morgan_fp("C/C=C/C");
+        assert!(fp_popcount(&fp) > 0);
+    }
 }
