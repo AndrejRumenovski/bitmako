@@ -6,15 +6,11 @@
 //! all requests behind `Arc` — every field involved is a read-only mmap or an
 //! async-safe handle, so concurrent requests need no locking.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::StatusCode;
-use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -25,73 +21,9 @@ use crate::etl::fingerprint::compute_morgan_fp;
 use crate::search::query::SimilarityQuery;
 use crate::search::Searcher;
 
-/// Hard ceiling on `top_k`, independent of whatever the UI's `<input max>`
-/// suggests — a public-facing deployment can't trust the client to respect
-/// that hint, since the request body is just JSON anyone can POST directly.
-const MAX_TOP_K: usize = 500;
-
-/// Requests allowed per IP per rolling window on `/search`. Generous enough
-/// for a person clicking around the demo UI, tight enough that a script
-/// can't hammer a public instance into a compute bill.
-const RATE_LIMIT_MAX_REQUESTS: u32 = 30;
-const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-
 struct AppState {
     searcher: Searcher,
     lance: Option<lance::dataset::Dataset>,
-    /// Optional banner text shown in the UI (e.g. "demo running a 50M-compound
-    /// subset of the full 1.36B corpus") — `None` for a normal/local deployment.
-    demo_notice: Option<String>,
-    limiter: RateLimiter,
-}
-
-/// Minimal fixed-window, per-IP request limiter. Deliberately not a crate
-/// dependency: a `Mutex<HashMap>` is all a single-process demo server needs,
-/// and it keeps `Cargo.toml` unchanged for what is otherwise a one-file concern.
-struct RateLimiter {
-    windows: Mutex<HashMap<IpAddr, (Instant, u32)>>,
-}
-
-impl RateLimiter {
-    fn new() -> Self {
-        RateLimiter { windows: Mutex::new(HashMap::new()) }
-    }
-
-    /// Returns `true` if `ip` is still within its rate limit for the current
-    /// window (and records this call), `false` if it must be rejected.
-    fn check(&self, ip: IpAddr) -> bool {
-        let mut windows = self.windows.lock().unwrap();
-        let now = Instant::now();
-        let entry = windows.entry(ip).or_insert((now, 0));
-        if now.duration_since(entry.0) > RATE_LIMIT_WINDOW {
-            *entry = (now, 0);
-        }
-        entry.1 += 1;
-        entry.1 <= RATE_LIMIT_MAX_REQUESTS
-    }
-}
-
-async fn rate_limit_middleware(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<Arc<AppState>>,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    if state.limiter.check(addr.ip()) {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse {
-                error: format!(
-                    "rate limit exceeded: max {} requests per {}s per IP",
-                    RATE_LIMIT_MAX_REQUESTS,
-                    RATE_LIMIT_WINDOW.as_secs()
-                ),
-            }),
-        )
-            .into_response()
-    }
 }
 
 /// The single-page search UI, embedded at compile time so the server ships as
@@ -168,8 +100,6 @@ struct HealthResponse {
     lance_attached: bool,
     prop_store_attached: bool,
     fingerprint_type: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    demo_notice: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -194,7 +124,6 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
         lance_attached: state.lance.is_some(),
         prop_store_attached: state.searcher.has_prop_store(),
         fingerprint_type: crate::etl::fingerprint::FINGERPRINT_KIND,
-        demo_notice: state.demo_notice.clone(),
     })
 }
 
@@ -207,9 +136,6 @@ async fn handle_search(
     }
     if req.top_k == 0 {
         return Err(bad_request("top_k must be >= 1"));
-    }
-    if req.top_k > MAX_TOP_K {
-        return Err(bad_request(format!("top_k must be <= {MAX_TOP_K}")));
     }
 
     let has_filters = req.mw_max.is_some() || req.logp_max.is_some();
@@ -295,17 +221,8 @@ async fn resolve_via_lance(
 /// Start the HTTP API on `bind:port`, serving until the process is killed.
 ///
 /// `searcher` and the optional Lance dataset (opened from `lance_path` if given)
-/// are loaded once and shared across all requests via `Arc<AppState>`. `demo_notice`,
-/// when set, is surfaced via `/health` and shown as a banner in the UI — intended
-/// for a public demo instance running a subset of the full corpus (see
-/// `bitmako extract-subset`), so visitors aren't misled about scale.
-pub async fn run_server(
-    searcher: Searcher,
-    lance_path: Option<String>,
-    bind: &str,
-    port: u16,
-    demo_notice: Option<String>,
-) -> Result<()> {
+/// are loaded once and shared across all requests via `Arc<AppState>`.
+pub async fn run_server(searcher: Searcher, lance_path: Option<String>, bind: &str, port: u16) -> Result<()> {
     let lance = match lance_path {
         Some(p) => {
             let dataset = lance::dataset::Dataset::open(&p).await.lance_err()?;
@@ -315,18 +232,12 @@ pub async fn run_server(
         None => None,
     };
 
-    let state = Arc::new(AppState { searcher, lance, demo_notice, limiter: RateLimiter::new() });
-
-    // Rate limiting only applies to /search (the expensive route) — /health and
-    // the static UI page are cheap and harmless to hit freely.
-    let search_route = axum::Router::new()
-        .route("/search", post(handle_search))
-        .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
+    let state = Arc::new(AppState { searcher, lance });
 
     let app = Router::new()
         .route("/", get(handle_index))
         .route("/health", get(handle_health))
-        .merge(search_route)
+        .route("/search", post(handle_search))
         .with_state(state);
 
     let addr = format!("{}:{}", bind, port);
@@ -335,11 +246,6 @@ pub async fn run_server(
         .map_err(BitMakoError::Io)?;
     info!("BitMako HTTP API listening on http://{}", addr);
     info!("Search UI: http://{}/", addr);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(BitMakoError::Io)?;
+    axum::serve(listener, app).await.map_err(BitMakoError::Io)?;
     Ok(())
 }

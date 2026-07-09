@@ -872,7 +872,6 @@ dependencies = [
  "arrow-cast",
  "arrow-ipc",
  "arrow-schema",
- "arrow-select",
  "axum",
  "bincode",
  "bytemuck",
