@@ -83,6 +83,24 @@
     font-weight: 600;
   }
 
+  /* ---------- demo notice banner ---------- */
+
+  #demo-notice {
+    display: none;
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--amber);
+    background: #FCEFE3;
+    border: 1px solid #EAC7A3;
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: -16px 0 32px;
+  }
+
+  #demo-notice.show {
+    display: block;
+  }
+
   /* ---------- search form ---------- */
 
   .eyebrow {
@@ -428,6 +446,8 @@
     <div class="corpus-count" id="corpus-count">connecting…</div>
   </header>
 
+  <div id="demo-notice" role="note"></div>
+
   <form id="search-form">
     <span class="eyebrow">SMILES</span>
     <input id="smiles" name="smiles" type="text" autocomplete="off" spellcheck="false"
@@ -506,6 +526,7 @@
 
   var els = {
     corpusCount: document.getElementById('corpus-count'),
+    demoNotice: document.getElementById('demo-notice'),
     form: document.getElementById('search-form'),
     smiles: document.getElementById('smiles'),
     threshold: document.getElementById('threshold'),
@@ -581,6 +602,10 @@
       state.corpusSize = h.compounds;
       state.fingerprintType = h.fingerprint_type || null;
       els.corpusCount.innerHTML = '<strong>' + fmtInt(h.compounds) + '</strong> compounds indexed';
+      if (h.demo_notice) {
+        els.demoNotice.textContent = h.demo_notice;
+        els.demoNotice.classList.add('show');
+      }
       if (!state.propStoreAttached) {
         els.mwMax.disabled = true;
         els.logpMax.disabled = true;

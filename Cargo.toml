@@ -32,6 +32,7 @@ arrow-array = "53"
 arrow-schema = "53"
 arrow-ipc = "53"
 arrow-cast = "53"
+arrow-select = "53"
 
 # Lance columnar dataset
 lance = "0.22"

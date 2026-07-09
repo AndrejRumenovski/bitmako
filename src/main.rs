@@ -9,7 +9,8 @@
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES> [--lance <dataset.lance>] --threshold 0.7 --top-k 100
 //!   bitmako search         --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --prop-store <store.prop> --query <SMILES> --mw-max 500 --logp-max 5
 //!   bitmako search-batch   --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --queries <queries.smi> --threshold 0.7 --top-k 50 [--output results.tsv]
-//!   bitmako serve          --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> [--prop-store <store.prop>] [--lance <dataset.lance>] [--port 8080]
+//!   bitmako serve          --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> [--prop-store <store.prop>] [--lance <dataset.lance>] [--port 8080] [--demo-notice "text"]
+//!   bitmako extract-subset --lance <full.lance> --output <subset.lance> --limit N [--stride K]
 
 use std::path::PathBuf;
 use std::process;
@@ -58,9 +59,10 @@ fn main() {
         "serve" => cmd_serve(&args[2..]),
         "bench-linear" => cmd_bench_linear(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
+        "extract-subset" => cmd_extract_subset(&args[2..]),
         other => {
             eprintln!("Unknown command: {}", other);
-            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|search-batch|serve|bench-linear|verify> [options]");
+            eprintln!("Usage: bitmako <ingest|build-index|build-skip|build-fp-store|build-prop-store|search|search-batch|serve|bench-linear|verify|extract-subset> [options]");
             process::exit(1);
         }
     };
@@ -943,6 +945,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     let lance_path: Option<String> = flag_value(args, "--lance");
     let bind = flag_value(args, "--bind").unwrap_or_else(|| "127.0.0.1".to_string());
     let port: u16 = flag_parsed_or(args, "--port", 8080);
+    let demo_notice: Option<String> = flag_value(args, "--demo-notice");
 
     let index = IndexReader::open(&index_path)?;
     info!("Loaded index: {} compounds", index.num_compounds);
@@ -959,7 +962,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
         .build()
         .map_err(BitMakoError::Io)?;
 
-    rt.block_on(bitmako::api::run_server(searcher, lance_path, &bind, port))
+    rt.block_on(bitmako::api::run_server(searcher, lance_path, &bind, port, demo_notice))
 }
 
 /// `verify --index <index.bitmako> --fp-store <store.fp> [--sample N]`
@@ -1037,6 +1040,92 @@ fn cmd_verify(args: &[String]) -> Result<()> {
             mismatches
         )))
     }
+}
+
+/// `extract-subset --lance <full.lance> --output <subset.lance> --limit N [--stride K]`
+///
+/// Carves a small subset dataset out of the full compound Lance dataset, in the
+/// same schema/row-order convention every other builder expects — the subset's
+/// `doc_id`s (its Lance scan order) are what `build-index`/`build-skip`/
+/// `build-fp-store`/`build-prop-store` run against next, exactly as they would
+/// against the full corpus. Intended for building a small, hostable public demo
+/// (e.g. a few tens of millions of compounds) without re-running the multi-day
+/// ingest — the full `compounds.lance` is the only source of raw SMILES, so this
+/// reads from it rather than the original (long since deleted) `.bz2` file.
+///
+/// With `--stride K` (default 1), every Kth row is kept instead of a plain
+/// prefix, for a subset spread across the whole corpus rather than just its
+/// first rows; this requires scanning the entire source dataset once (a single
+/// pass, same cost as `build-index`'s Pass 0) rather than stopping early.
+fn cmd_extract_subset(args: &[String]) -> Result<()> {
+    let lance_path_str = require_flag(args, "--lance");
+    let output = PathBuf::from(require_flag(args, "--output"));
+    let limit: usize = flag_parsed_or(args, "--limit", 0);
+    let stride: usize = flag_parsed_or(args, "--stride", 1);
+
+    if limit == 0 {
+        return Err(BitMakoError::Query("--limit must be >= 1".into()));
+    }
+    if stride == 0 {
+        return Err(BitMakoError::Query("--stride must be >= 1".into()));
+    }
+
+    info!(
+        "Extracting subset: {} rows (stride={}) from {} → {:?}",
+        limit, stride, lance_path_str, output
+    );
+
+    let rt = current_thread_runtime()?;
+
+    rt.block_on(async {
+        use futures::TryStreamExt;
+        use lance::dataset::Dataset;
+
+        let dataset = Dataset::open(&lance_path_str).await.lance_err()?;
+        let mut stream = dataset.scan().try_into_stream().await.lance_err()?;
+
+        let mut kept: Vec<arrow_array::RecordBatch> = Vec::new();
+        let mut seen: usize = 0;
+        let mut kept_count: usize = 0;
+
+        'scan: while let Some(batch) = stream.try_next().await.lance_err()? {
+            // Row indices (within this batch) to keep, honoring `stride` against
+            // the running `seen` count across all batches so far.
+            let mut take_rows: Vec<usize> = Vec::new();
+            for row in 0..batch.num_rows() {
+                if seen % stride == 0 {
+                    take_rows.push(row);
+                }
+                seen += 1;
+                if kept_count + take_rows.len() >= limit {
+                    break;
+                }
+            }
+
+            if !take_rows.is_empty() {
+                let indices = arrow_array::UInt32Array::from(
+                    take_rows.iter().map(|&r| r as u32).collect::<Vec<_>>(),
+                );
+                let taken = arrow_select::take::take_record_batch(&batch, &indices)
+                    .map_err(BitMakoError::Arrow)?;
+                kept_count += taken.num_rows();
+                kept.push(taken);
+            }
+
+            if kept_count >= limit {
+                break 'scan;
+            }
+        }
+
+        if kept.is_empty() {
+            return Err(BitMakoError::IndexBuild("source dataset produced zero rows".into()));
+        }
+
+        bitmako::etl::writer::write_lance_dataset(kept, &output, false).await?;
+        info!("Subset written: {} compounds → {:?}", kept_count, output);
+        println!("Wrote {} compounds to {:?}", kept_count, output);
+        Ok::<(), BitMakoError>(())
+    })
 }
 
 /// `bench-linear --fp-store <store.fp> --query <SMILES> --threshold T [--sample N] [--top-k K]`
