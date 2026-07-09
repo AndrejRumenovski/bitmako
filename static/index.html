@@ -312,6 +312,13 @@
     background: var(--teal);
   }
 
+  /* Neutral variant for bars that represent context rather than the signal
+     itself (query-only / candidate-only bits) — same track+fill "ramp"
+     pattern as the default teal bar, just drawn from the ink-muted/rule
+     tokens instead, so it never competes visually with the teal ones. */
+  .peak-track.muted { background: var(--rule); }
+  .peak-fill.muted { background: var(--ink-muted); }
+
   /* ---------- similarity analysis panel ---------- */
 
   .analysis-toggle {
@@ -347,8 +354,10 @@
     display: flex;
     gap: 24px;
     flex-wrap: wrap;
-    margin-bottom: 10px;
+    margin-bottom: 14px;
   }
+
+  .analysis-stat { min-width: 110px; }
 
   .analysis-stat-label {
     display: block;
@@ -359,6 +368,17 @@
     text-transform: uppercase;
     color: var(--ink-muted);
   }
+
+  /* Bar + value, reusing the results table's own peak-track/peak-fill meter
+     component (same track+fill pattern, just wider) rather than a new one. */
+  .analysis-stat-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 5px;
+  }
+  .analysis-stat-row .peak-track { width: 84px; }
+
   .analysis-stat-value {
     font-family: var(--mono);
     font-size: 16px;
@@ -612,17 +632,36 @@
     return td;
   }
 
-  function analysisStat(label, value, opts) {
+  // A labeled stat with a bar underneath, sized to `frac` (0..1) of the track
+  // width — reuses the results table's own peak-track/peak-fill meter so the
+  // panel doesn't introduce a second bar component.
+  function analysisStat(label, value, frac, opts) {
     opts = opts || {};
     var wrap = document.createElement('div');
+    wrap.className = 'analysis-stat';
+
     var lbl = document.createElement('span');
     lbl.className = 'analysis-stat-label';
     lbl.textContent = label;
+    wrap.appendChild(lbl);
+
+    var row = document.createElement('div');
+    row.className = 'analysis-stat-row';
+
+    var track = document.createElement('div');
+    track.className = 'peak-track' + (opts.muted ? ' muted' : '');
+    var fill = document.createElement('div');
+    fill.className = 'peak-fill' + (opts.muted ? ' muted' : '');
+    fill.style.width = Math.round(Math.min(Math.max(frac, 0), 1) * 100) + '%';
+    track.appendChild(fill);
+    row.appendChild(track);
+
     var val = document.createElement('span');
     val.className = 'analysis-stat-value' + (opts.shared ? ' shared' : '');
     val.textContent = value;
-    wrap.appendChild(lbl);
-    wrap.appendChild(val);
+    row.appendChild(val);
+
+    wrap.appendChild(row);
     return wrap;
   }
 
@@ -639,11 +678,19 @@
     var panel = document.createElement('div');
     panel.className = 'analysis-panel';
 
+    // Shared/query-only/candidate-only bits partition the Tanimoto union, so
+    // scaling all three bars against that same total makes them visually
+    // comparable — and makes the shared-bits bar's length literally equal to
+    // the similarity score's own bar, tying the two together.
+    var total = r.shared_bits + r.query_unique_bits + r.candidate_unique_bits;
+    var frac = function (n) { return total > 0 ? n / total : 0; };
+
     var stats = document.createElement('div');
     stats.className = 'analysis-stats';
-    stats.appendChild(analysisStat('Shared bits', fmtInt(r.shared_bits), { shared: true }));
-    stats.appendChild(analysisStat('Query-unique bits', fmtInt(r.query_unique_bits)));
-    stats.appendChild(analysisStat('Candidate-unique bits', fmtInt(r.candidate_unique_bits)));
+    stats.appendChild(analysisStat('Similarity score', r.score.toFixed(4), r.score, { shared: true }));
+    stats.appendChild(analysisStat('Shared bits', fmtInt(r.shared_bits), frac(r.shared_bits), { shared: true }));
+    stats.appendChild(analysisStat('Query-unique bits', fmtInt(r.query_unique_bits), frac(r.query_unique_bits), { muted: true }));
+    stats.appendChild(analysisStat('Candidate-unique bits', fmtInt(r.candidate_unique_bits), frac(r.candidate_unique_bits), { muted: true }));
     panel.appendChild(stats);
 
     var explanation = document.createElement('p');

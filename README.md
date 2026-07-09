@@ -119,8 +119,9 @@ is attached:
 ![Search Statistics dashboard and results table](docs/screenshots/pruning-readout.png)
 
 **Similarity Analysis panel, expanded** — clicking "Analysis" on any result
-reveals the bit-level breakdown behind its score and a generated explanation
-of the match, without cluttering the default table view:
+reveals the bit-level breakdown behind its score, a proportional bar per
+number, and a generated explanation of the match, without cluttering the
+default table view:
 
 ![Similarity Analysis panel expanded for one result](docs/screenshots/similarity-analysis.png)
 
@@ -282,6 +283,17 @@ sentence bands the score into a qualitative tier (`high` ≥ 0.7, `moderate`
 every number quoted in the sentence itself is the real, freshly computed
 value for that specific pair, not a lookup or a template with blanks filled
 from metadata.
+
+In the web UI, all four numbers (score, shared, query-unique, candidate-unique)
+get a small bar alongside the value, each sized against the same denominator
+(the Tanimoto union) so the bars are directly comparable — the shared-bits
+bar is always exactly as long as the score bar, since `shared/union` *is*
+the score. Shared bits and the score reuse the results table's own teal
+meter; the two "context" bars (query-only, candidate-only) are drawn from a
+neutral gray ramp instead, so the one number that actually drove the ranking
+stays visually distinct from the two that didn't. No new bar component was
+introduced — same `peak-track`/`peak-fill` markup as the results table's
+score column, just reused at a second size.
 
 **Where it lives:** `src/search/analysis.rs` is a small, pure, dependency-free
 module — one function, `analyze(query_fp, candidate_fp) -> SimilarityAnalysis`,
