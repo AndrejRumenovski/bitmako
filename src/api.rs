@@ -96,6 +96,10 @@ struct SearchResultItem {
     framework_fraction: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     scaffold_key: Option<u64>,
+    /// R-group decomposition — same gating as the scaffold fields above
+    /// (only present with `--lance`). See `search::scaffold::decompose`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    r_groups: Option<Vec<RGroupItem>>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +107,32 @@ struct ScaffoldGroupItem {
     scaffold_smiles: String,
     scaffold_key: u64,
     count: u32,
+}
+
+#[derive(Serialize)]
+struct RGroupItem {
+    attach_symbol: String,
+    smiles: String,
+}
+
+#[derive(Serialize)]
+struct RGroupColumnItem {
+    label: String,
+    attach_symbol: String,
+}
+
+#[derive(Serialize)]
+struct RGroupRowItem {
+    member_index: usize,
+    cells: Vec<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct RGroupTableItem {
+    scaffold_key: u64,
+    scaffold_smiles: String,
+    columns: Vec<RGroupColumnItem>,
+    rows: Vec<RGroupRowItem>,
 }
 
 #[derive(Serialize)]
@@ -120,6 +150,11 @@ struct SearchResponse {
     /// "N results span M distinct scaffolds" grouping — empty without
     /// `--lance` (same gating as the per-result scaffold fields above).
     scaffold_groups: Vec<ScaffoldGroupItem>,
+    /// SAR tables — one per scaffold shared by 2+ returned results, with
+    /// substituents aligned into R1/R2/… columns by attachment position.
+    /// Built from the results actually being returned (post-diversity-picking,
+    /// if `diverse` was set) — empty without `--lance`.
+    rgroup_tables: Vec<RGroupTableItem>,
 }
 
 #[derive(Serialize)]
@@ -213,11 +248,12 @@ async fn handle_search(
         item.explanation = analysis.explanation;
     }
 
-    // Scaffold Analysis: only possible when `--lance` is attached (extraction
-    // needs the candidate's SMILES, not just its fingerprint — see
-    // `search::scaffold`). Another cheap post-processing pass over the same
-    // top-k set, not a second search.
+    // Scaffold Analysis + R-group decomposition: only possible when `--lance`
+    // is attached (both need the candidate's SMILES, not just its
+    // fingerprint — see `search::scaffold`). Cheap post-processing passes
+    // over the same top-k set, not a second search.
     let mut scaffold_groups = Vec::new();
+    let mut rgroups: Vec<scaffold::RGroupDecomposition> = Vec::new();
     if state.lance.is_some() {
         let smiles_list: Vec<String> = items.iter().map(|it| it.smiles.clone().unwrap_or_default()).collect();
         let scaffolds = state.searcher.scaffold_results(&smiles_list);
@@ -232,23 +268,53 @@ async fn handle_search(
             .into_iter()
             .map(|g| ScaffoldGroupItem { scaffold_smiles: g.scaffold_smiles, scaffold_key: g.scaffold_key, count: g.count })
             .collect();
+
+        rgroups = state.searcher.rgroup_results(&smiles_list);
+        for (item, d) in items.iter_mut().zip(rgroups.iter()) {
+            item.r_groups = Some(
+                d.r_groups
+                    .iter()
+                    .map(|r| RGroupItem { attach_symbol: r.attach_symbol.clone(), smiles: r.smiles.clone() })
+                    .collect(),
+            );
+        }
     }
 
     // Diversity picking: keep only the best-scoring (first, since `items` is
     // still score-ranked) hit per distinct scaffold. Post-processes the same
     // top-k WAND already returned rather than over-fetching for a fuller
     // MaxMin-style pick, so a diverse response can come back shorter than
-    // `top_k` — same tradeoff as the `search --diverse` CLI flag.
+    // `top_k` — same tradeoff as the `search --diverse` CLI flag. `rgroups`
+    // is filtered in lockstep so the SAR tables built below only ever
+    // reflect results actually being returned.
     if req.diverse {
         let keys: Vec<u64> = items.iter().map(|it| it.scaffold_key.unwrap_or(0)).collect();
-        let keep: std::collections::HashSet<usize> = scaffold::diverse_indices(&keys).into_iter().collect();
-        let mut i = 0;
-        items.retain(|_| {
-            let keep_this = keep.contains(&i);
-            i += 1;
-            keep_this
-        });
+        let keep = scaffold::diverse_indices(&keys);
+        let mut new_items = Vec::with_capacity(keep.len());
+        let mut new_rgroups = Vec::with_capacity(keep.len());
+        for &i in &keep {
+            new_items.push(std::mem::take(&mut items[i]));
+            if let Some(d) = rgroups.get(i) {
+                new_rgroups.push(d.clone());
+            }
+        }
+        items = new_items;
+        rgroups = new_rgroups;
     }
+
+    let rgroup_tables = scaffold::r_group_tables(&rgroups)
+        .into_iter()
+        .map(|t| RGroupTableItem {
+            scaffold_key: t.scaffold_key,
+            scaffold_smiles: t.scaffold_smiles,
+            columns: t
+                .columns
+                .into_iter()
+                .map(|c| RGroupColumnItem { label: c.label, attach_symbol: c.attach_symbol })
+                .collect(),
+            rows: t.rows.into_iter().map(|r| RGroupRowItem { member_index: r.member_index, cells: r.cells }).collect(),
+        })
+        .collect();
 
     Ok(Json(SearchResponse {
         query_smiles: req.smiles,
@@ -258,6 +324,7 @@ async fn handle_search(
         eval_fraction_pct: stats.eval_fraction() * 100.0,
         search_time_ms,
         scaffold_groups,
+        rgroup_tables,
     }))
 }
 

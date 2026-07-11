@@ -499,6 +499,11 @@ fn cmd_build_prop_store(args: &[String]) -> Result<()> {
 /// scaffold — so top_k spans as many different chemical cores as the candidate pool
 /// allows, rather than being dominated by close analogs of the same one. See
 /// `bitmako::search::scaffold::diverse_indices`.
+///
+/// R-group decomposition (always shown with `--lance`, no flag — parity with Scaffold
+/// Analysis): each result's substituents, and an SAR table for every scaffold shared by
+/// 2+ shown results with its substituents aligned into R1/R2/… columns by attachment
+/// position. See `bitmako::search::scaffold::decompose`/`r_group_tables`.
 fn cmd_search(args: &[String]) -> Result<()> {
     let index_path = PathBuf::from(require_flag(args, "--index"));
     let skip_path = PathBuf::from(require_flag(args, "--skip"));
@@ -607,6 +612,12 @@ fn cmd_search(args: &[String]) -> Result<()> {
             let smiles_list: Vec<String> = resolved.iter().map(|r| r.smiles.clone()).collect();
             let scaffolds = searcher.scaffold_results(&smiles_list);
 
+            // R-group decomposition: same shape as Scaffold Analysis above,
+            // but split into the scaffold plus the substituents removed to
+            // reach it. Aligned into SAR tables after the loop for whichever
+            // scaffolds end up shared by 2+ shown results.
+            let rgroups = searcher.rgroup_results(&smiles_list);
+
             // Candidates in descending score order (WAND's native order), restricted
             // to those passing the property filter, if any.
             let mut eligible: Vec<usize> = (0..results.len())
@@ -624,6 +635,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
             }
 
             let mut shown_scaffolds = Vec::new();
+            let mut shown_rgroups = Vec::new();
             for (shown, &i) in eligible.iter().take(top_k).enumerate() {
                 let (_, score) = results[i];
                 let r = &resolved[i];
@@ -641,7 +653,9 @@ fn cmd_search(args: &[String]) -> Result<()> {
                 );
                 print_similarity_analysis(&analyses[i]);
                 print_scaffold_analysis(&scaffolds[i]);
+                print_rgroups(&rgroups[i]);
                 shown_scaffolds.push(scaffolds[i].clone());
+                shown_rgroups.push(rgroups[i].clone());
             }
 
             if use_lance_filter {
@@ -656,6 +670,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
                 );
             }
             print_scaffold_summary(&shown_scaffolds);
+            print_rgroup_tables(&bitmako::search::scaffold::r_group_tables(&shown_rgroups));
 
             Ok::<(), BitMakoError>(())
         })?;
@@ -720,6 +735,40 @@ fn print_scaffold_summary(scaffolds: &[bitmako::search::scaffold::ScaffoldAnalys
     for g in &groups {
         let label = if g.scaffold_smiles.is_empty() { "(acyclic, no ring scaffold)" } else { &g.scaffold_smiles };
         println!("  {} × {}", label, g.count);
+    }
+}
+
+/// Print one result's R-groups: the substituents stripped to reach its
+/// scaffold, tagged with the scaffold atom each attaches to. Only ever
+/// called from the `--lance` branch — see `bitmako::search::scaffold::decompose`.
+fn print_rgroups(d: &bitmako::search::scaffold::RGroupDecomposition) {
+    if d.r_groups.is_empty() {
+        return;
+    }
+    let parts: Vec<String> = d.r_groups.iter().map(|r| format!("{}: {}", r.attach_symbol, r.smiles)).collect();
+    println!("      r_groups: {}", parts.join(", "));
+}
+
+/// Print an SAR table for every scaffold shared by 2+ shown results — the
+/// substituents on each aligned into consistent R1/R2/… columns by attachment
+/// position. See `bitmako::search::scaffold::r_group_tables`.
+fn print_rgroup_tables(tables: &[bitmako::search::scaffold::RGroupTable]) {
+    if tables.is_empty() {
+        return;
+    }
+    println!(
+        "{} scaffold group{} with shared substitution pattern:",
+        tables.len(),
+        if tables.len() == 1 { "" } else { "s" }
+    );
+    for t in tables {
+        let header: Vec<String> = t.columns.iter().map(|c| format!("{}({})", c.label, c.attach_symbol)).collect();
+        println!("  scaffold {} — {}", t.scaffold_smiles, header.join("  "));
+        for row in &t.rows {
+            let cells: Vec<String> =
+                row.cells.iter().map(|c| if c.is_empty() { "H".to_string() } else { c.join(",") }).collect();
+            println!("    #{}: {}", row.member_index + 1, cells.join("  "));
+        }
     }
 }
 

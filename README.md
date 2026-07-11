@@ -111,17 +111,18 @@ collapsed property-filter panel:
 
 **Search Statistics dashboard and results** — after a query, a compact
 dashboard summarizes it (molecules searched against the full corpus,
-matches, execution time, fingerprint type, average/maximum similarity),
-followed by the ranked results table with Tanimoto scores, an inline
-peak-bar per result, and resolved SMILES/property columns when `--lance`
-is attached:
+matches, execution time, fingerprint type, average/maximum similarity, and,
+when `--lance` is attached, how many distinct Bemis-Murcko scaffolds and
+R-group SAR tables the result set spans), followed by the ranked results
+table with Tanimoto scores, an inline peak-bar per result, and resolved
+SMILES/property columns:
 
 ![Search Statistics dashboard and results table](docs/screenshots/pruning-readout.png)
 
 **Similarity Analysis panel, expanded** — clicking "Analysis" on any result
 reveals the bit-level breakdown behind its score, a proportional bar per
-number, and a generated explanation of the match, without cluttering the
-default table view:
+number, a generated explanation of the match, its Bemis-Murcko scaffold, and
+the R-groups stripped to reach it, without cluttering the default table view:
 
 ![Similarity Analysis panel expanded for one result](docs/screenshots/similarity-analysis.png)
 

@@ -33,12 +33,22 @@
 //!    canonicalizer (it doesn't search over automorphism choices to find a
 //!    minimal string), which is why `scaffold_key`, not the string itself, is
 //!    the grouping key.
+//! 5. **R-group decomposition** (`decompose`): every atom the 2-core pass
+//!    strips is, by construction, part of an acyclic fragment touching the
+//!    scaffold at exactly one bond (a second attachment point would put that
+//!    fragment's atoms on a cycle, so they'd have survived the 2-core
+//!    instead) — so "one dead connected component" and "one substituent"
+//!    coincide exactly, with no extra bookkeeping to tell them apart. Each
+//!    substituent's attachment position is tagged with its scaffold atom's
+//!    color from step 3, which is what lets `r_group_tables` align
+//!    substituents from *different* molecules sharing a scaffold into
+//!    consistent R1/R2/… columns — an SAR table.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use crate::etl::fingerprint::{parse_smiles, Bond, Molecule};
+use crate::etl::fingerprint::{parse_smiles, Atom, Bond, Molecule};
 
 /// Bemis-Murcko scaffold summary for a single molecule.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +86,71 @@ pub struct ScaffoldGroup {
     pub count: u32,
 }
 
+/// One substituent removed from a molecule to reach its Bemis-Murcko
+/// scaffold, plus where it attaches. Since any ring survives the 2-core
+/// reduction, every stripped connected component is acyclic and touches the
+/// scaffold at exactly one bond (see module doc comment) — so "one dead
+/// component" and "one R-group" coincide exactly, no ambiguity to resolve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RGroup {
+    /// `color_refine` color of the scaffold atom this substituent attaches
+    /// to. Stable across any two molecules sharing a scaffold — the same
+    /// invariant `scaffold_key` relies on — so it's the key `r_group_tables`
+    /// aligns substituents by column on.
+    pub attach_color: u32,
+    /// Element symbol of the scaffold attachment atom (lowercase if
+    /// aromatic), e.g. "c", "N" — enough context to read one substituent on
+    /// its own, without its scaffold alongside it.
+    pub attach_symbol: String,
+    /// The substituent as SMILES, rooted at a `*` dummy marking the
+    /// attachment bond — e.g. `"*F"`, `"*OC(C)=O"`.
+    pub smiles: String,
+}
+
+/// A molecule split into its Bemis-Murcko scaffold plus the substituents
+/// stripped to reach it. `r_groups` is empty and `scaffold_key == 0` for
+/// acyclic or unparseable input, mirroring `analyze`'s degrade-gracefully
+/// contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RGroupDecomposition {
+    pub scaffold_key: u64,
+    pub scaffold_smiles: String,
+    pub r_groups: Vec<RGroup>,
+}
+
+/// One aligned column of an `RGroupTable`: a scaffold attachment position
+/// shared by every member of the group, labeled `R1`, `R2`, … in ascending
+/// `attach_color` order (an arbitrary but deterministic numbering — the
+/// colors themselves aren't meaningful outside this module).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RGroupColumn {
+    pub label: String,
+    pub attach_symbol: String,
+}
+
+/// One molecule's row in an `RGroupTable`: `cells[i]` holds the substituent
+/// SMILES attached at `columns[i]`'s position — empty if unsubstituted there
+/// (i.e. that position is a bare hydrogen), more than one entry if the
+/// molecule has two distinct substituents at symmetry-equivalent positions
+/// that collapsed into the same column (see `r_group_tables`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RGroupRow {
+    /// Index into the `decomps` slice `r_group_tables` was called with —
+    /// callers map this back to whichever result/rank ordering they used.
+    pub member_index: usize,
+    pub cells: Vec<Vec<String>>,
+}
+
+/// A scaffold-group's substituents aligned into a table: one column per
+/// distinct attachment position across the group, one row per member.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RGroupTable {
+    pub scaffold_key: u64,
+    pub scaffold_smiles: String,
+    pub columns: Vec<RGroupColumn>,
+    pub rows: Vec<RGroupRow>,
+}
+
 /// Compact framework-only graph (ring + linker atoms only, reindexed 0..k),
 /// built by inducing the original molecule's 2-core. All of this module's
 /// graph algorithms after stripping operate on this smaller structure.
@@ -109,7 +184,7 @@ pub fn analyze(smiles: &str) -> ScaffoldAnalysis {
         return empty_analysis(heavy_atoms);
     }
 
-    let sub = induce_subgraph(&mol, &alive);
+    let (sub, _map) = induce_subgraph(&mol, &alive);
     let n = sub.len();
 
     let bridges = find_bridges(&sub);
@@ -173,6 +248,191 @@ pub fn diverse_indices(scaffold_keys: &[u64]) -> Vec<usize> {
     keep
 }
 
+/// Split `smiles` into its Bemis-Murcko scaffold plus the substituents
+/// removed to reach it. Never panics — degrades the same way `analyze` does.
+pub fn decompose(smiles: &str) -> RGroupDecomposition {
+    let mol = match parse_smiles(smiles) {
+        Ok(m) if !m.atoms.is_empty() => m,
+        _ => return empty_decomposition(),
+    };
+    let alive = two_core(&mol);
+    if !alive.iter().any(|&a| a) {
+        return empty_decomposition();
+    }
+
+    let (sub, map) = induce_subgraph(&mol, &alive);
+    let colors = color_refine(&sub);
+    let scaffold_key = compute_scaffold_key(&sub, &colors);
+    let scaffold_smiles = write_smiles(&sub, &colors);
+
+    let n = mol.atoms.len();
+    let mut visited_dead = vec![false; n];
+    let mut r_groups = Vec::new();
+    for s in 0..n {
+        if !alive[s] {
+            continue;
+        }
+        for &(t, bond) in &mol.neighbors[s] {
+            if alive[t] || visited_dead[t] {
+                continue;
+            }
+            let frag_atoms = flood_fill_fragment(&mol, t, &alive, &mut visited_dead);
+            let smiles = fragment_smiles(&mol, &frag_atoms, bond);
+            r_groups.push(RGroup {
+                attach_color: colors[map[s]],
+                attach_symbol: element_symbol(&mol.atoms[s]),
+                smiles,
+            });
+        }
+    }
+    // Sorted (not deduplicated by value) so genuinely distinct substituents
+    // at symmetry-equivalent positions — e.g. resorcinol's two -OH groups,
+    // which land in the same `attach_color` column — both survive; collapsing
+    // same-(color, SMILES) entries would silently understate substitution.
+    r_groups.sort_by(|a, b| a.attach_color.cmp(&b.attach_color).then_with(|| a.smiles.cmp(&b.smiles)));
+    RGroupDecomposition { scaffold_key, scaffold_smiles, r_groups }
+}
+
+fn empty_decomposition() -> RGroupDecomposition {
+    RGroupDecomposition { scaffold_key: 0, scaffold_smiles: String::new(), r_groups: Vec::new() }
+}
+
+/// Collects one maximal connected component of atoms stripped by the 2-core
+/// pass, starting from `start` — exactly one R-group's atoms. Marks every
+/// atom it visits in `visited` so the same fragment is never built twice even
+/// though it may be reachable from more than one scaffold-atom neighbor scan
+/// in the caller (relevant only for the degenerate single-atom-fragment case,
+/// where the fragment has no other alive neighbors to rediscover it from).
+fn flood_fill_fragment(mol: &Molecule, start: usize, alive: &[bool], visited: &mut [bool]) -> Vec<usize> {
+    visited[start] = true;
+    let mut atoms = vec![start];
+    let mut stack = vec![start];
+    while let Some(u) = stack.pop() {
+        for &(v, _) in &mol.neighbors[u] {
+            if !alive[v] && !visited[v] {
+                visited[v] = true;
+                atoms.push(v);
+                stack.push(v);
+            }
+        }
+    }
+    atoms
+}
+
+/// Render one substituent fragment as SMILES: a standalone tiny `SubGraph`
+/// with a dummy `*` atom (atomic_num 0) at index 0, bonded via the original
+/// crossing bond to the fragment's copy of `frag_atoms[0]` (the atom directly
+/// bonded to the scaffold), followed by the rest of the fragment with its
+/// internal bonds. Canonically colored and rooted at the dummy so the
+/// attachment point is always written first — reuses the same
+/// `color_refine`/`write_smiles_rooted` the scaffold writer itself uses.
+fn fragment_smiles(mol: &Molecule, frag_atoms: &[usize], attach_bond: Bond) -> String {
+    let mut map = HashMap::new();
+    let mut atomic_num = vec![0u8]; // index 0: the dummy attachment atom.
+    let mut is_aromatic = vec![false];
+    let mut charge = vec![0i8];
+    for &orig in frag_atoms {
+        map.insert(orig, atomic_num.len());
+        atomic_num.push(mol.atoms[orig].atomic_num);
+        is_aromatic.push(mol.atoms[orig].is_aromatic);
+        charge.push(mol.atoms[orig].charge);
+    }
+
+    let mut adj = vec![Vec::new(); atomic_num.len()];
+    let root_idx = map[&frag_atoms[0]];
+    adj[0].push((root_idx, attach_bond));
+    adj[root_idx].push((0, attach_bond));
+    for &orig in frag_atoms {
+        let u = map[&orig];
+        for &(v_orig, bond) in &mol.neighbors[orig] {
+            if let Some(&v) = map.get(&v_orig) {
+                if u < v {
+                    adj[u].push((v, bond));
+                    adj[v].push((u, bond));
+                }
+            }
+        }
+    }
+
+    let frag_sub = SubGraph { atomic_num, is_aromatic, charge, adj };
+    let frag_colors = color_refine(&frag_sub);
+    write_smiles_rooted(&frag_sub, &frag_colors, 0)
+}
+
+fn element_symbol(atom: &Atom) -> String {
+    let base = symbol_for(atom.atomic_num);
+    if atom.is_aromatic { base.to_lowercase() } else { base.to_string() }
+}
+
+/// Align a batch of already-computed decompositions into SAR tables — one
+/// per scaffold shared by 2+ members (scaffold-free entries and singleton
+/// groups have nothing to align, so they're skipped). Tables are ordered by
+/// descending membership, then scaffold SMILES, matching `group`.
+pub fn r_group_tables(decomps: &[RGroupDecomposition]) -> Vec<RGroupTable> {
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, d) in decomps.iter().enumerate() {
+        if d.scaffold_key != 0 {
+            buckets.entry(d.scaffold_key).or_default().push(i);
+        }
+    }
+
+    let mut tables: Vec<RGroupTable> = buckets
+        .into_iter()
+        .filter(|(_, members)| members.len() >= 2)
+        .map(|(scaffold_key, members)| build_table(decomps, scaffold_key, members))
+        .collect();
+    tables.sort_by(|a, b| b.rows.len().cmp(&a.rows.len()).then_with(|| a.scaffold_smiles.cmp(&b.scaffold_smiles)));
+    tables
+}
+
+/// Build one scaffold group's SAR table: columns are the group's distinct
+/// `attach_color` values in ascending order (an arbitrary but deterministic
+/// R1..Rn numbering), rows are the group's members with each substituent
+/// slotted into its color's column.
+fn build_table(decomps: &[RGroupDecomposition], scaffold_key: u64, members: Vec<usize>) -> RGroupTable {
+    let scaffold_smiles = decomps[members[0]].scaffold_smiles.clone();
+
+    let mut colors: Vec<u32> = members
+        .iter()
+        .flat_map(|&i| decomps[i].r_groups.iter().map(|r| r.attach_color))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    colors.sort_unstable();
+
+    // `attach_symbol` is a function of the scaffold atom's element, so it's
+    // identical for every occurrence of a given color in this group — take
+    // it from wherever the color first turns up.
+    let columns: Vec<RGroupColumn> = colors
+        .iter()
+        .enumerate()
+        .map(|(idx, &color)| {
+            let attach_symbol = members
+                .iter()
+                .find_map(|&i| {
+                    decomps[i].r_groups.iter().find(|r| r.attach_color == color).map(|r| r.attach_symbol.clone())
+                })
+                .unwrap_or_default();
+            RGroupColumn { label: format!("R{}", idx + 1), attach_symbol }
+        })
+        .collect();
+
+    let rows: Vec<RGroupRow> = members
+        .iter()
+        .map(|&member_index| {
+            let mut cells = vec![Vec::new(); colors.len()];
+            for r in &decomps[member_index].r_groups {
+                if let Ok(col) = colors.binary_search(&r.attach_color) {
+                    cells[col].push(r.smiles.clone());
+                }
+            }
+            RGroupRow { member_index, cells }
+        })
+        .collect();
+
+    RGroupTable { scaffold_key, scaffold_smiles, columns, rows }
+}
+
 fn empty_analysis(heavy_atoms: u32) -> ScaffoldAnalysis {
     ScaffoldAnalysis {
         scaffold_smiles: String::new(),
@@ -218,8 +478,11 @@ fn two_core(mol: &Molecule) -> Vec<bool> {
 
 /// Build the framework-only subgraph: reindex surviving atoms 0..k and keep
 /// only edges between two surviving atoms (this is what actually drops the
-/// stripped side chains from the eventual SMILES output).
-fn induce_subgraph(mol: &Molecule, alive: &[bool]) -> SubGraph {
+/// stripped side chains from the eventual SMILES output). Also returns the
+/// original-molecule-index → subgraph-index map (`usize::MAX` for stripped
+/// atoms) — `decompose` needs it to look up a scaffold atom's canonical color
+/// starting from an original atom index.
+fn induce_subgraph(mol: &Molecule, alive: &[bool]) -> (SubGraph, Vec<usize>) {
     let n = mol.atoms.len();
     let mut map = vec![usize::MAX; n];
     let mut atomic_num = Vec::new();
@@ -250,7 +513,7 @@ fn induce_subgraph(mol: &Molecule, alive: &[bool]) -> SubGraph {
             }
         }
     }
-    SubGraph { atomic_num, is_aromatic, charge, adj }
+    (SubGraph { atomic_num, is_aromatic, charge, adj }, map)
 }
 
 /// Tarjan bridge-finding over the framework subgraph. A bridge is a linker
@@ -455,9 +718,20 @@ fn write_smiles(sub: &SubGraph, colors: &[u32]) -> String {
     if n == 0 {
         return String::new();
     }
-
     let order_key = |i: usize| (colors[i], i);
     let root = (0..n).min_by_key(|&i| order_key(i)).unwrap();
+    write_smiles_rooted(sub, colors, root)
+}
+
+/// Same DFS-to-SMILES serialization as `write_smiles`, but rooted at a caller-
+/// chosen atom instead of the lowest-`(color, index)` one — used by
+/// `decompose` to root a substituent fragment's SMILES at its dummy `*` atom
+/// so the attachment point is always written first.
+fn write_smiles_rooted(sub: &SubGraph, colors: &[u32], root: usize) -> String {
+    let n = sub.len();
+    if n == 0 {
+        return String::new();
+    }
 
     let mut visited = vec![false; n];
     let mut children: Vec<Vec<(usize, Bond)>> = vec![Vec::new(); n];
@@ -597,8 +871,11 @@ fn atom_token(sub: &SubGraph, i: usize) -> String {
     }
 }
 
+/// `0` is never a real element — it's `decompose`'s dummy attachment atom
+/// (or, in principle, a literal SMILES `*` wildcard), so it renders as `*`.
 fn symbol_for(atomic_num: u8) -> &'static str {
     match atomic_num {
+        0 => "*",
         1 => "H",
         5 => "B",
         6 => "C",
@@ -785,5 +1062,117 @@ mod tests {
         .collect();
         let keys: Vec<u64> = analyses.iter().map(|a| a.scaffold_key).collect();
         assert_eq!(diverse_indices(&keys), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn toluene_decomposes_to_one_methyl_r_group() {
+        let d = decompose("Cc1ccccc1");
+        assert_eq!(d.scaffold_smiles, "c1ccccc1");
+        assert_eq!(d.r_groups.len(), 1);
+        assert_eq!(d.r_groups[0].attach_symbol, "c");
+        assert_eq!(d.r_groups[0].smiles, "*C");
+    }
+
+    #[test]
+    fn aspirin_decomposes_to_two_r_groups_on_the_ring() {
+        // Acetyl ester + carboxylic acid, both stripped down to the bare
+        // benzene scaffold — matches `aspirin_scaffold_is_the_bare_benzene_ring`.
+        let d = decompose("CC(=O)Oc1ccccc1C(=O)O");
+        assert_eq!(d.scaffold_smiles, "c1ccccc1");
+        assert_eq!(d.r_groups.len(), 2);
+        for r in &d.r_groups {
+            assert_eq!(r.attach_symbol, "c");
+            assert!(r.smiles.starts_with('*'));
+        }
+        let mut smiles: Vec<&str> = d.r_groups.iter().map(|r| r.smiles.as_str()).collect();
+        smiles.sort_unstable();
+        assert_eq!(smiles, vec!["*C(O)=O", "*OC(C)=O"]);
+    }
+
+    #[test]
+    fn acyclic_and_unparseable_smiles_decompose_to_nothing() {
+        for s in ["CCO", "", "[", "***"] {
+            let d = decompose(s);
+            assert_eq!(d.scaffold_smiles, "");
+            assert_eq!(d.scaffold_key, 0);
+            assert!(d.r_groups.is_empty());
+        }
+    }
+
+    #[test]
+    fn decompose_is_deterministic() {
+        let a = decompose("CC(=O)Oc1ccccc1C(=O)O");
+        let b = decompose("CC(=O)Oc1ccccc1C(=O)O");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn single_substituent_molecules_agree_with_scaffold_analysis() {
+        // Every r_group's attach_color must be a real color assigned to some
+        // scaffold atom -- cross-checked against `analyze`'s independently
+        // computed scaffold_key for the same molecule.
+        let smiles = "CC(=O)Oc1ccccc1C(=O)O";
+        let a = analyze(smiles);
+        let d = decompose(smiles);
+        assert_eq!(a.scaffold_key, d.scaffold_key);
+        assert_eq!(a.scaffold_smiles, d.scaffold_smiles);
+    }
+
+    #[test]
+    fn r_group_tables_aligns_positional_isomers_into_separate_columns() {
+        // 2- and 3-methylpyridine share a bare pyridine scaffold, but the
+        // ring position each methyl attaches to has a different
+        // `color_refine` color -- pyridine's N breaks the ring's full
+        // symmetry -- so the table gets two columns, each molecule filling
+        // one and leaving the other as H (an empty cell).
+        let decomps: Vec<RGroupDecomposition> = ["Cc1ccccn1", "Cc1cccnc1"].iter().map(|s| decompose(s)).collect();
+        let tables = r_group_tables(&decomps);
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert_eq!(t.columns.len(), 2);
+        assert_eq!(t.rows.len(), 2);
+        for row in &t.rows {
+            let filled: Vec<usize> = (0..row.cells.len()).filter(|&c| !row.cells[c].is_empty()).collect();
+            assert_eq!(filled.len(), 1, "expected exactly one filled column per row");
+        }
+        let col_of = |row: &RGroupRow| (0..row.cells.len()).find(|&c| !row.cells[c].is_empty()).unwrap();
+        assert_ne!(col_of(&t.rows[0]), col_of(&t.rows[1]));
+    }
+
+    #[test]
+    fn r_group_tables_collapses_symmetric_positions_into_one_column() {
+        // Benzene's ring positions are all graph-automorphic, so toluene's
+        // methyl and benzoic acid's carboxyl -- attached to different
+        // specific ring atoms in each molecule -- land on the same color,
+        // hence the same single column.
+        let decomps: Vec<RGroupDecomposition> =
+            ["Cc1ccccc1", "c1ccccc1C(=O)O"].iter().map(|s| decompose(s)).collect();
+        let tables = r_group_tables(&decomps);
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert_eq!(t.columns.len(), 1);
+        assert_eq!(t.columns[0].label, "R1");
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells[0], vec!["*C".to_string()]);
+        assert_eq!(t.rows[1].cells[0], vec!["*C(O)=O".to_string()]);
+    }
+
+    #[test]
+    fn r_group_tables_skips_scaffold_free_and_singleton_groups() {
+        // "CCO" has no scaffold at all; naphthalene is the only member of
+        // its own scaffold group -- neither has anything to align against.
+        let decomps: Vec<RGroupDecomposition> =
+            ["CCO", "Cc1ccccc1", "c1ccc2ccccc2c1"].iter().map(|s| decompose(s)).collect();
+        assert!(r_group_tables(&decomps).is_empty());
+    }
+
+    #[test]
+    fn r_group_tables_member_index_maps_back_to_input_order() {
+        let decomps: Vec<RGroupDecomposition> =
+            ["Cc1ccccc1", "c1ccccc1C(=O)O"].iter().map(|s| decompose(s)).collect();
+        let tables = r_group_tables(&decomps);
+        let mut indices: Vec<usize> = tables[0].rows.iter().map(|r| r.member_index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![0, 1]);
     }
 }

@@ -282,11 +282,11 @@
     font-size: clamp(26px, 5vw, 38px);
   }
 
-  /* The "Scaffolds" stat cell doubles as a toggle for the breakdown panel
-     below it — styled like the other stat values but a real <button>, since
-     it's interactive. Hidden entirely without --lance (scaffold extraction
-     needs SMILES; see the per-result gating on scaffold_smiles below). */
-  .scaffolds-toggle {
+  /* The "Scaffolds" and "R-Groups" stat cells double as toggles for the
+     breakdown panel below them — styled like the other stat values but a
+     real <button>, since they're interactive. Hidden entirely without
+     --lance (both need SMILES; see the per-result gating below). */
+  .stat-toggle {
     background: none;
     border: none;
     padding: 0;
@@ -299,7 +299,7 @@
     text-decoration: underline dotted;
     text-underline-offset: 4px;
   }
-  .scaffolds-toggle:hover { color: var(--teal); }
+  .stat-toggle:hover { color: var(--teal); }
 
   #scaffold-groups-panel {
     display: none;
@@ -332,6 +332,49 @@
     flex: none;
     white-space: nowrap;
   }
+
+  /* R-group SAR tables: one small grid per scaffold shared by 2+ results,
+     columns aligned by attachment position (search::scaffold::r_group_tables). */
+  #rgroup-tables-panel {
+    display: none;
+    padding: 4px 0 24px;
+    border-bottom: 1px solid var(--rule);
+  }
+  #rgroup-tables-panel.open { display: block; }
+
+  .rgroup-table-wrap { margin-bottom: 20px; }
+  .rgroup-table-wrap:last-child { margin-bottom: 0; }
+  .rgroup-table-scaffold {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 6px;
+  }
+  table.rgroup-table {
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  table.rgroup-table th {
+    font-family: var(--sans);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    text-align: left;
+    padding: 4px 16px 4px 0;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  table.rgroup-table td {
+    font-family: var(--mono);
+    padding: 4px 16px 4px 0;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+    color: var(--ink);
+  }
+  table.rgroup-table td.rgroup-h { color: var(--ink-muted); }
 
   /* ---------- results table ---------- */
 
@@ -497,6 +540,26 @@
     color: var(--ink-muted);
   }
 
+  /* R-groups: the substituents stripped to reach the scaffold above, each
+     tagged with the scaffold atom it attaches to (search::scaffold::decompose).
+     Only rendered when non-empty — acyclic hits have none to show. */
+  .analysis-rgroups { margin-bottom: 14px; }
+  .analysis-rgroup-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .analysis-rgroup-item {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink);
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 2px 6px;
+  }
+
   /* ---------- footer ---------- */
 
   footer {
@@ -598,12 +661,18 @@
     </div>
     <div class="stat-cell" id="stat-cell-scaffolds" style="display: none;">
       <span class="stat-label">Scaffolds</span>
-      <button type="button" class="scaffolds-toggle" id="stat-scaffolds" aria-expanded="false">—</button>
+      <button type="button" class="stat-toggle" id="stat-scaffolds" aria-expanded="false">—</button>
       <span class="stat-caption" id="stat-scaffolds-caption"></span>
+    </div>
+    <div class="stat-cell" id="stat-cell-rgroups" style="display: none;">
+      <span class="stat-label">R-Groups</span>
+      <button type="button" class="stat-toggle" id="stat-rgroups" aria-expanded="false">—</button>
+      <span class="stat-caption" id="stat-rgroups-caption"></span>
     </div>
   </section>
 
   <div id="scaffold-groups-panel" aria-label="Scaffold breakdown"></div>
+  <div id="rgroup-tables-panel" aria-label="R-group tables"></div>
 
   <div id="results-wrap"></div>
 
@@ -647,6 +716,10 @@
     statScaffolds: document.getElementById('stat-scaffolds'),
     statScaffoldsCaption: document.getElementById('stat-scaffolds-caption'),
     scaffoldGroupsPanel: document.getElementById('scaffold-groups-panel'),
+    statCellRgroups: document.getElementById('stat-cell-rgroups'),
+    statRgroups: document.getElementById('stat-rgroups'),
+    statRgroupsCaption: document.getElementById('stat-rgroups-caption'),
+    rgroupTablesPanel: document.getElementById('rgroup-tables-panel'),
     resultsWrap: document.getElementById('results-wrap'),
   };
 
@@ -699,6 +772,11 @@
     els.statScaffolds.setAttribute('aria-expanded', String(open));
   });
 
+  els.statRgroups.addEventListener('click', function () {
+    var open = els.rgroupTablesPanel.classList.toggle('open');
+    els.statRgroups.setAttribute('aria-expanded', String(open));
+  });
+
   // "N results span M distinct scaffolds" breakdown: one row per shared
   // scaffold, sorted by frequency (resp.scaffold_groups is pre-sorted
   // server-side by search::scaffold::group), bar length scaled against the
@@ -732,6 +810,64 @@
       row.appendChild(count);
 
       els.scaffoldGroupsPanel.appendChild(row);
+    });
+  }
+
+  // One grid per scaffold shared by 2+ results (resp.rgroup_tables — see
+  // search::scaffold::r_group_tables), columns aligned by attachment
+  // position. `row.member_index` indexes back into `results` (the same
+  // array rendered as the results table), used here only to label each row
+  // with the rank/compound it corresponds to.
+  function renderRgroupTables(tables, results) {
+    els.rgroupTablesPanel.innerHTML = '';
+    tables.forEach(function (t) {
+      var wrap = document.createElement('div');
+      wrap.className = 'rgroup-table-wrap';
+
+      var label = document.createElement('div');
+      label.className = 'rgroup-table-scaffold';
+      label.textContent = t.scaffold_smiles || '(acyclic, no ring scaffold)';
+      wrap.appendChild(label);
+
+      var table = document.createElement('table');
+      table.className = 'rgroup-table';
+
+      var thead = document.createElement('thead');
+      var headRow = document.createElement('tr');
+      headRow.appendChild(document.createElement('th'));
+      t.columns.forEach(function (c) {
+        var th = document.createElement('th');
+        th.textContent = c.label + ' (' + c.attach_symbol + ')';
+        headRow.appendChild(th);
+      });
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+
+      var tbody = document.createElement('tbody');
+      t.rows.forEach(function (row) {
+        var tr = document.createElement('tr');
+        var rankTd = document.createElement('td');
+        rankTd.textContent = '#' + (row.member_index + 1);
+        var res = results[row.member_index];
+        if (res && res.compound_id) rankTd.title = res.compound_id;
+        tr.appendChild(rankTd);
+        row.cells.forEach(function (cell) {
+          var td = document.createElement('td');
+          if (cell.length === 0) {
+            td.textContent = 'H';
+            td.className = 'rgroup-h';
+          } else {
+            td.textContent = cell.join(', ');
+            td.title = cell.join(', ');
+          }
+          tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+
+      wrap.appendChild(table);
+      els.rgroupTablesPanel.appendChild(wrap);
     });
   }
 
@@ -892,6 +1028,31 @@
       panel.appendChild(scaffoldWrap);
     }
 
+    // R-groups: the substituents stripped to reach the scaffold above, each
+    // tagged with the scaffold atom it attaches to. Empty for acyclic hits
+    // (nothing to strip), so nothing renders in that case.
+    if (r.r_groups !== undefined && r.r_groups.length > 0) {
+      var rgroupsWrap = document.createElement('div');
+      rgroupsWrap.className = 'analysis-rgroups';
+
+      var rgroupsLabel = document.createElement('span');
+      rgroupsLabel.className = 'analysis-stat-label';
+      rgroupsLabel.textContent = 'R-Groups';
+      rgroupsWrap.appendChild(rgroupsLabel);
+
+      var rgroupsList = document.createElement('div');
+      rgroupsList.className = 'analysis-rgroup-list';
+      r.r_groups.forEach(function (rg) {
+        var item = document.createElement('span');
+        item.className = 'analysis-rgroup-item';
+        item.textContent = rg.attach_symbol + ' → ' + rg.smiles;
+        item.title = rg.smiles;
+        rgroupsList.appendChild(item);
+      });
+      rgroupsWrap.appendChild(rgroupsList);
+      panel.appendChild(rgroupsWrap);
+    }
+
     var explanation = document.createElement('p');
     explanation.className = 'analysis-explanation';
     explanation.textContent = r.explanation;
@@ -991,6 +1152,10 @@
     els.scaffoldGroupsPanel.classList.remove('open');
     els.scaffoldGroupsPanel.innerHTML = '';
     els.statScaffolds.setAttribute('aria-expanded', 'false');
+    els.statCellRgroups.style.display = 'none';
+    els.rgroupTablesPanel.classList.remove('open');
+    els.rgroupTablesPanel.innerHTML = '';
+    els.statRgroups.setAttribute('aria-expanded', 'false');
 
     els.searchBtn.disabled = true;
     els.searchBtn.textContent = 'Searching…';
@@ -1032,6 +1197,15 @@
           els.statScaffoldsCaption.textContent = 'across ' + fmtInt(resp.results.length) + ' results';
           els.statCellScaffolds.style.display = '';
           renderScaffoldGroups(resp.scaffold_groups);
+        }
+
+        // R-group SAR tables — same gating as scaffold grouping above; empty
+        // whenever no scaffold in the result set is shared by 2+ results.
+        if (resp.rgroup_tables && resp.rgroup_tables.length > 0) {
+          els.statRgroups.textContent = fmtInt(resp.rgroup_tables.length);
+          els.statRgroupsCaption.textContent = 'across ' + fmtInt(resp.results.length) + ' results';
+          els.statCellRgroups.style.display = '';
+          renderRgroupTables(resp.rgroup_tables, resp.results);
         }
 
         if (resp.results.length === 0) {

@@ -152,6 +152,15 @@ impl Searcher {
         smiles.iter().map(|s| crate::search::scaffold::analyze(s)).collect()
     }
 
+    /// Compute an R-group [`scaffold::RGroupDecomposition`] for each SMILES
+    /// string — same shape and cost profile as `scaffold_results` (SMILES in,
+    /// not doc_ids, since decomposition needs the molecular graph). Callers
+    /// pass the result to `scaffold::r_group_tables` to align a result set's
+    /// substituents into SAR tables.
+    pub fn rgroup_results(&self, smiles: &[String]) -> Vec<crate::search::scaffold::RGroupDecomposition> {
+        smiles.iter().map(|s| crate::search::scaffold::decompose(s)).collect()
+    }
+
     /// Convenience: search by SMILES string instead of pre-computed fingerprint.
     pub fn search_by_smiles(
         &self,
