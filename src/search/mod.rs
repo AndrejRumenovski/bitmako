@@ -5,6 +5,7 @@ pub mod fp_store;
 pub mod lance_lookup;
 pub mod prop_store;
 pub mod query;
+pub mod scaffold;
 pub mod tanimoto;
 pub mod wand;
 
@@ -138,6 +139,17 @@ impl Searcher {
             .filter_map(|(doc_id, _)| self.fp_store.get(*doc_id))
             .map(|candidate_fp| analyze(&query.query_fp, &candidate_fp))
             .collect()
+    }
+
+    /// Compute a Bemis-Murcko [`scaffold::ScaffoldAnalysis`] for each SMILES
+    /// string. Unlike `analyze_results`, this takes SMILES rather than doc_ids:
+    /// scaffold extraction needs the actual molecular graph, not just the
+    /// fingerprint, so it only ever runs over results a caller has already
+    /// resolved via Lance (see `search::lance_lookup::resolve_compounds`).
+    /// Same cost profile as `analyze_results` — a cheap post-processing pass
+    /// over the (small) top-k set, never the corpus.
+    pub fn scaffold_results(&self, smiles: &[String]) -> Vec<crate::search::scaffold::ScaffoldAnalysis> {
+        smiles.iter().map(|s| crate::search::scaffold::analyze(s)).collect()
     }
 
     /// Convenience: search by SMILES string instead of pre-computed fingerprint.

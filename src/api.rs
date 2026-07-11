@@ -19,6 +19,7 @@ use tracing::info;
 use crate::error::{BitMakoError, LanceResultExt, Result};
 use crate::etl::fingerprint::compute_morgan_fp;
 use crate::search::query::SimilarityQuery;
+use crate::search::scaffold;
 use crate::search::Searcher;
 
 struct AppState {
@@ -77,6 +78,26 @@ struct SearchResultItem {
     query_unique_bits: u32,
     candidate_unique_bits: u32,
     explanation: String,
+    /// Bemis-Murcko scaffold fields — only present when `--lance` is
+    /// attached, since extraction needs the candidate's SMILES text, not
+    /// just its fingerprint. See `search::scaffold`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scaffold_smiles: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ring_systems: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scaffold_atoms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    framework_fraction: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scaffold_key: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ScaffoldGroupItem {
+    scaffold_smiles: String,
+    scaffold_key: u64,
+    count: u32,
 }
 
 #[derive(Serialize)]
@@ -91,6 +112,9 @@ struct SearchResponse {
     /// the SMILES/property lookup that happens afterward. Search Statistics
     /// panel field; see `handle_search`.
     search_time_ms: f64,
+    /// "N results span M distinct scaffolds" grouping — empty without
+    /// `--lance` (same gating as the per-result scaffold fields above).
+    scaffold_groups: Vec<ScaffoldGroupItem>,
 }
 
 #[derive(Serialize)]
@@ -181,6 +205,27 @@ async fn handle_search(
         item.explanation = analysis.explanation;
     }
 
+    // Scaffold Analysis: only possible when `--lance` is attached (extraction
+    // needs the candidate's SMILES, not just its fingerprint — see
+    // `search::scaffold`). Another cheap post-processing pass over the same
+    // top-k set, not a second search.
+    let mut scaffold_groups = Vec::new();
+    if state.lance.is_some() {
+        let smiles_list: Vec<String> = items.iter().map(|it| it.smiles.clone().unwrap_or_default()).collect();
+        let scaffolds = state.searcher.scaffold_results(&smiles_list);
+        for (item, sc) in items.iter_mut().zip(scaffolds.iter()) {
+            item.scaffold_smiles = Some(sc.scaffold_smiles.clone());
+            item.ring_systems = Some(sc.ring_systems);
+            item.scaffold_atoms = Some(sc.scaffold_atoms);
+            item.framework_fraction = Some(sc.framework_fraction);
+            item.scaffold_key = Some(sc.scaffold_key);
+        }
+        scaffold_groups = scaffold::group(&scaffolds)
+            .into_iter()
+            .map(|g| ScaffoldGroupItem { scaffold_smiles: g.scaffold_smiles, scaffold_key: g.scaffold_key, count: g.count })
+            .collect();
+    }
+
     Ok(Json(SearchResponse {
         query_smiles: req.smiles,
         query_pop,
@@ -188,6 +233,7 @@ async fn handle_search(
         docs_evaluated: stats.docs_evaluated,
         eval_fraction_pct: stats.eval_fraction() * 100.0,
         search_time_ms,
+        scaffold_groups,
     }))
 }
 

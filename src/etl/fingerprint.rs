@@ -42,8 +42,12 @@ fn is_aromatic_symbol(c: char) -> bool {
 }
 
 /// Bond order encoding
+///
+/// `pub(crate)`: reused by `search::scaffold` for Bemis-Murcko extraction, which
+/// needs the same graph the fingerprint parser builds — see that module's doc
+/// comment for why it doesn't run a third independent SMILES scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Bond {
+pub(crate) enum Bond {
     Single,
     Double,
     Triple,
@@ -51,7 +55,7 @@ enum Bond {
 }
 
 impl Bond {
-    fn order(self) -> u8 {
+    pub(crate) fn order(self) -> u8 {
         match self {
             Bond::Single => 1,
             Bond::Double => 2,
@@ -63,17 +67,17 @@ impl Bond {
 
 /// Lightweight atom representation for fingerprint computation
 #[derive(Clone, Debug)]
-struct Atom {
-    atomic_num: u8,
-    is_aromatic: bool,
-    charge: i8,
-    h_count: u8,
+pub(crate) struct Atom {
+    pub(crate) atomic_num: u8,
+    pub(crate) is_aromatic: bool,
+    pub(crate) charge: i8,
+    pub(crate) h_count: u8,
 }
 
 /// Molecular graph: atoms + adjacency list
-struct Molecule {
-    atoms: Vec<Atom>,
-    neighbors: Vec<Vec<(usize, Bond)>>,
+pub(crate) struct Molecule {
+    pub(crate) atoms: Vec<Atom>,
+    pub(crate) neighbors: Vec<Vec<(usize, Bond)>>,
 }
 
 impl Molecule {
@@ -99,7 +103,7 @@ impl Molecule {
 
 /// Parse SMILES into a molecular graph.
 /// Handles: organic subset atoms, bracket atoms, branches, ring closures, explicit bonds.
-fn parse_smiles(smiles: &str) -> Result<Molecule> {
+pub(crate) fn parse_smiles(smiles: &str) -> Result<Molecule> {
     let mut mol = Molecule::new();
     let bytes = smiles.as_bytes();
     let len = bytes.len();

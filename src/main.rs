@@ -587,9 +587,20 @@ fn cmd_search(args: &[String]) -> Result<()> {
             let doc_ids: Vec<u32> = results.iter().map(|(d, _)| *d).collect();
             let resolved = bitmako::search::lance_lookup::resolve_compounds(&dataset, &doc_ids).await?;
 
+            // Scaffold Analysis: like Similarity Analysis, a cheap post-processing
+            // pass over the already-resolved top-k results — but keyed on SMILES,
+            // not doc_id/fingerprint, since Bemis-Murcko extraction needs the real
+            // molecular graph. Only available here (the --lance branch) because
+            // only here do we have SMILES at all. See `bitmako::search::scaffold`.
+            let smiles_list: Vec<String> = resolved.iter().map(|r| r.smiles.clone()).collect();
+            let scaffolds = searcher.scaffold_results(&smiles_list);
+
             // Walk candidates in descending score order; apply property filters; stop at top_k.
             let mut shown = 0usize;
-            for (((_, score), r), a) in results.iter().zip(resolved.iter()).zip(analyses.iter()) {
+            let mut shown_scaffolds = Vec::new();
+            for ((((_, score), r), a), sc) in
+                results.iter().zip(resolved.iter()).zip(analyses.iter()).zip(scaffolds.iter())
+            {
                 if use_lance_filter && !query.filter_passes(&r.properties) {
                     continue;
                 }
@@ -607,6 +618,8 @@ fn cmd_search(args: &[String]) -> Result<()> {
                     r.properties.ring_count,
                 );
                 print_similarity_analysis(a);
+                print_scaffold_analysis(sc);
+                shown_scaffolds.push(sc.clone());
                 if shown == top_k {
                     break;
                 }
@@ -615,10 +628,12 @@ fn cmd_search(args: &[String]) -> Result<()> {
             if use_lance_filter {
                 println!("({} of {} WAND candidates passed property filter)", shown, results.len());
             }
+            print_scaffold_summary(&shown_scaffolds);
 
             Ok::<(), BitMakoError>(())
         })?;
     } else {
+        println!("(scaffold analysis requires --lance for SMILES; not shown)");
         for (rank, ((doc_id, score), a)) in results.iter().zip(analyses.iter()).enumerate() {
             println!("  #{}: doc_id={} tanimoto={:.4}", rank + 1, doc_id, score);
             print_similarity_analysis(a);
@@ -640,6 +655,45 @@ fn print_similarity_analysis(a: &bitmako::search::analysis::SimilarityAnalysis) 
         a.shared_bits, a.query_unique_bits, a.candidate_unique_bits
     );
     println!("      {}", a.explanation);
+}
+
+/// Print the Bemis-Murcko scaffold line for one result: the ring-system core
+/// with side chains stripped, plus how much of the molecule that core is.
+/// Only ever called from the `--lance` branch — see `bitmako::search::scaffold`.
+fn print_scaffold_analysis(s: &bitmako::search::scaffold::ScaffoldAnalysis) {
+    if s.scaffold_smiles.is_empty() {
+        println!("      scaffold: none (acyclic)");
+    } else {
+        println!(
+            "      scaffold: {} | {} ring system{} | {} scaffold atoms ({:.0}% framework)",
+            s.scaffold_smiles,
+            s.ring_systems,
+            if s.ring_systems == 1 { "" } else { "s" },
+            s.scaffold_atoms,
+            s.framework_fraction * 100.0,
+        );
+    }
+}
+
+/// Print the "N results span M distinct scaffolds" grouping summary after a
+/// `--lance` search — the whole point of computing scaffolds per result
+/// rather than just displaying them: seeing which hits actually share a core.
+fn print_scaffold_summary(scaffolds: &[bitmako::search::scaffold::ScaffoldAnalysis]) {
+    if scaffolds.is_empty() {
+        return;
+    }
+    let groups = bitmako::search::scaffold::group(scaffolds);
+    println!(
+        "{} result{} span {} distinct scaffold{}",
+        scaffolds.len(),
+        if scaffolds.len() == 1 { "" } else { "s" },
+        groups.len(),
+        if groups.len() == 1 { "" } else { "s" },
+    );
+    for g in &groups {
+        let label = if g.scaffold_smiles.is_empty() { "(acyclic, no ring scaffold)" } else { &g.scaffold_smiles };
+        println!("  {} × {}", label, g.count);
+    }
 }
 
 /// One query line parsed from a `--queries` file: `SMILES [ID]` per line,

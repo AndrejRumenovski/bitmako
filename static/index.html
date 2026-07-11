@@ -34,8 +34,12 @@
     -webkit-font-smoothing: antialiased;
   }
 
+  /* Wide enough that the results table's many columns (once SMILES/property/
+     compound data is attached) fit without horizontal scrolling on a normal
+     window — the original 860px was sized for the search form alone and
+     didn't anticipate a fully-populated results table. */
   main {
-    max-width: 860px;
+    max-width: 1400px;
     margin: 0 auto;
     padding: 0 24px 96px;
   }
@@ -258,6 +262,57 @@
     font-size: clamp(26px, 5vw, 38px);
   }
 
+  /* The "Scaffolds" stat cell doubles as a toggle for the breakdown panel
+     below it — styled like the other stat values but a real <button>, since
+     it's interactive. Hidden entirely without --lance (scaffold extraction
+     needs SMILES; see the per-result gating on scaffold_smiles below). */
+  .scaffolds-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 22px;
+    color: var(--ink);
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 4px;
+  }
+  .scaffolds-toggle:hover { color: var(--teal); }
+
+  #scaffold-groups-panel {
+    display: none;
+    padding: 4px 0 24px;
+    border-bottom: 1px solid var(--rule);
+  }
+  #scaffold-groups-panel.open { display: block; }
+
+  .scaffold-group-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 5px 0;
+  }
+  .scaffold-group-row .peak-track { width: 100px; }
+  .scaffold-group-smiles {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink);
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .scaffold-group-count {
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--ink-muted);
+    flex: none;
+    white-space: nowrap;
+  }
+
   /* ---------- results table ---------- */
 
   #results-wrap { margin-top: 32px; overflow-x: auto; }
@@ -290,8 +345,12 @@
     vertical-align: middle;
   }
 
-  #results td.smiles-cell {
+  #results td.smiles-cell,
+  #results td.compound-cell {
     font-family: var(--mono);
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   #results th.num, #results td.num { text-align: right; }
@@ -394,6 +453,30 @@
     color: var(--ink);
   }
 
+  /* Bemis-Murcko scaffold: the ring-system core with side chains stripped,
+     shown as its own SMILES string above the bit-level explanation. Only
+     rendered when the API included it (--lance attached; see renderResults). */
+  .analysis-scaffold { margin-bottom: 14px; }
+  .analysis-scaffold-smiles {
+    display: block;
+    font-family: var(--mono);
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+  .analysis-scaffold-meta {
+    display: block;
+    margin-top: 2px;
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--ink-muted);
+  }
+
   /* ---------- footer ---------- */
 
   footer {
@@ -488,7 +571,14 @@
       <span class="stat-label">Fingerprint</span>
       <span class="stat-value text" id="stat-fp">—</span>
     </div>
+    <div class="stat-cell" id="stat-cell-scaffolds" style="display: none;">
+      <span class="stat-label">Scaffolds</span>
+      <button type="button" class="scaffolds-toggle" id="stat-scaffolds" aria-expanded="false">—</button>
+      <span class="stat-caption" id="stat-scaffolds-caption"></span>
+    </div>
   </section>
+
+  <div id="scaffold-groups-panel" aria-label="Scaffold breakdown"></div>
 
   <div id="results-wrap"></div>
 
@@ -526,6 +616,10 @@
     statAvg: document.getElementById('stat-avg'),
     statMax: document.getElementById('stat-max'),
     statFp: document.getElementById('stat-fp'),
+    statCellScaffolds: document.getElementById('stat-cell-scaffolds'),
+    statScaffolds: document.getElementById('stat-scaffolds'),
+    statScaffoldsCaption: document.getElementById('stat-scaffolds-caption'),
+    scaffoldGroupsPanel: document.getElementById('scaffold-groups-panel'),
     resultsWrap: document.getElementById('results-wrap'),
   };
 
@@ -573,6 +667,47 @@
     els.advRow.classList.toggle('open');
   });
 
+  els.statScaffolds.addEventListener('click', function () {
+    var open = els.scaffoldGroupsPanel.classList.toggle('open');
+    els.statScaffolds.setAttribute('aria-expanded', String(open));
+  });
+
+  // "N results span M distinct scaffolds" breakdown: one row per shared
+  // scaffold, sorted by frequency (resp.scaffold_groups is pre-sorted
+  // server-side by search::scaffold::group), bar length scaled against the
+  // largest group so the most common core is always a full-width bar.
+  function renderScaffoldGroups(groups) {
+    els.scaffoldGroupsPanel.innerHTML = '';
+    if (groups.length === 0) return;
+    var maxCount = groups[0].count;
+    groups.forEach(function (g) {
+      var row = document.createElement('div');
+      row.className = 'scaffold-group-row';
+
+      var track = document.createElement('div');
+      track.className = 'peak-track';
+      var fill = document.createElement('div');
+      fill.className = 'peak-fill';
+      fill.style.width = Math.round((g.count / maxCount) * 100) + '%';
+      track.appendChild(fill);
+      row.appendChild(track);
+
+      var smiles = document.createElement('span');
+      smiles.className = 'scaffold-group-smiles';
+      var label = g.scaffold_smiles || '(acyclic, no ring scaffold)';
+      smiles.textContent = label;
+      smiles.title = label;
+      row.appendChild(smiles);
+
+      var count = document.createElement('span');
+      count.className = 'scaffold-group-count';
+      count.textContent = fmtInt(g.count) + ' result' + (g.count === 1 ? '' : 's');
+      row.appendChild(count);
+
+      els.scaffoldGroupsPanel.appendChild(row);
+    });
+  }
+
   fetch('/health')
     .then(function (r) { return r.json(); })
     .then(function (h) {
@@ -608,6 +743,7 @@
     if (opts.num) td.classList.add('num');
     if (opts.className) td.classList.add(opts.className);
     td.textContent = text;
+    td.title = text; // full value on hover, since long compound IDs/SMILES are truncated visually
     return td;
   }
 
@@ -693,6 +829,37 @@
     stats.appendChild(analysisStat('Candidate-unique bits', fmtInt(r.candidate_unique_bits), frac(r.candidate_unique_bits), { muted: true }));
     panel.appendChild(stats);
 
+    // Bemis-Murcko scaffold: only present when the API resolved SMILES
+    // (--lance attached) — see search::scaffold and renderResults' gating
+    // on state.lanceAttached for the table columns this panel sits under.
+    if (r.scaffold_smiles !== undefined) {
+      var scaffoldWrap = document.createElement('div');
+      scaffoldWrap.className = 'analysis-scaffold';
+
+      var scaffoldLabel = document.createElement('span');
+      scaffoldLabel.className = 'analysis-stat-label';
+      scaffoldLabel.textContent = 'Scaffold';
+      scaffoldWrap.appendChild(scaffoldLabel);
+
+      var scaffoldSmiles = document.createElement('span');
+      scaffoldSmiles.className = 'analysis-scaffold-smiles';
+      if (r.scaffold_smiles) {
+        scaffoldSmiles.textContent = r.scaffold_smiles;
+        scaffoldSmiles.title = r.scaffold_smiles;
+
+        var scaffoldMeta = document.createElement('span');
+        scaffoldMeta.className = 'analysis-scaffold-meta';
+        scaffoldMeta.textContent = r.ring_systems + ' ring system' + (r.ring_systems === 1 ? '' : 's') +
+          ' · ' + r.scaffold_atoms + ' scaffold atoms · ' + Math.round(r.framework_fraction * 100) + '% framework';
+        scaffoldWrap.appendChild(scaffoldSmiles);
+        scaffoldWrap.appendChild(scaffoldMeta);
+      } else {
+        scaffoldSmiles.textContent = 'none (acyclic — no ring scaffold)';
+        scaffoldWrap.appendChild(scaffoldSmiles);
+      }
+      panel.appendChild(scaffoldWrap);
+    }
+
     var explanation = document.createElement('p');
     explanation.className = 'analysis-explanation';
     explanation.textContent = r.explanation;
@@ -746,7 +913,7 @@
       tr.appendChild(scoreCell(r.score));
       tr.appendChild(cell(String(r.doc_id), { num: true }));
       if (state.lanceAttached) {
-        tr.appendChild(cell(r.compound_id != null ? r.compound_id : '—'));
+        tr.appendChild(cell(r.compound_id != null ? r.compound_id : '—', { className: 'compound-cell' }));
         tr.appendChild(cell(r.smiles != null ? r.smiles : '—', { className: 'smiles-cell' }));
         tr.appendChild(cell(r.mw != null ? r.mw.toFixed(1) : '—', { num: true }));
         tr.appendChild(cell(r.logp != null ? r.logp.toFixed(2) : '—', { num: true }));
@@ -779,6 +946,10 @@
     clearEmpty();
     els.resultsWrap.innerHTML = '';
     els.statsDashboard.classList.remove('show');
+    els.statCellScaffolds.style.display = 'none';
+    els.scaffoldGroupsPanel.classList.remove('open');
+    els.scaffoldGroupsPanel.innerHTML = '';
+    els.statScaffolds.setAttribute('aria-expanded', 'false');
 
     els.searchBtn.disabled = true;
     els.searchBtn.textContent = 'Searching…';
@@ -812,6 +983,15 @@
         els.statMax.textContent = scores ? scores.max.toFixed(4) : '—';
         els.statFp.textContent = state.fingerprintType || '—';
         els.statsDashboard.classList.add('show');
+
+        // Scaffold grouping — only present when --lance is attached (see
+        // api.rs::handle_search); resp.scaffold_groups is [] otherwise.
+        if (resp.scaffold_groups && resp.scaffold_groups.length > 0) {
+          els.statScaffolds.textContent = fmtInt(resp.scaffold_groups.length);
+          els.statScaffoldsCaption.textContent = 'across ' + fmtInt(resp.results.length) + ' results';
+          els.statCellScaffolds.style.display = '';
+          renderScaffoldGroups(resp.scaffold_groups);
+        }
 
         if (resp.results.length === 0) {
           els.emptyBox.textContent = 'No hits above threshold ' + els.threshold.value +
