@@ -167,6 +167,26 @@
     max-width: 320px;
   }
 
+  .param-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 7px;
+  }
+  .param-check input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--teal);
+    cursor: pointer;
+  }
+  .param-check label {
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .param-check input:disabled + label { color: var(--ink-muted); cursor: default; }
+
   button#search-btn {
     margin-left: auto;
     font-family: var(--sans);
@@ -539,6 +559,11 @@
         <input id="logp_max" type="number" step="any" placeholder="none">
       </div>
       <div class="prop-note" id="prop-note"></div>
+      <div class="param param-check">
+        <input id="diverse" type="checkbox">
+        <label for="diverse">Diverse results</label>
+      </div>
+      <div class="prop-note" id="diverse-note"></div>
     </div>
   </form>
 
@@ -605,6 +630,8 @@
     advToggle: document.getElementById('advanced-toggle'),
     advRow: document.getElementById('advanced-row'),
     propNote: document.getElementById('prop-note'),
+    diverse: document.getElementById('diverse'),
+    diverseNote: document.getElementById('diverse-note'),
     searchBtn: document.getElementById('search-btn'),
     errorBox: document.getElementById('error-box'),
     emptyBox: document.getElementById('empty-box'),
@@ -721,6 +748,10 @@
         els.logpMax.disabled = true;
         els.propNote.textContent = 'Property filters are unavailable — this server was started without --prop-store.';
       }
+      if (!state.lanceAttached) {
+        els.diverse.disabled = true;
+        els.diverseNote.textContent = 'Diverse mode is unavailable — this server was started without --lance.';
+      }
     })
     .catch(function () {
       els.corpusCount.textContent = 'health check failed';
@@ -734,6 +765,7 @@
     };
     if (els.mwMax.value !== '' && !els.mwMax.disabled) body.mw_max = parseFloat(els.mwMax.value);
     if (els.logpMax.value !== '' && !els.logpMax.disabled) body.logp_max = parseFloat(els.logpMax.value);
+    if (els.diverse.checked && !els.diverse.disabled) body.diverse = true;
     return body;
   }
 

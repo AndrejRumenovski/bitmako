@@ -155,6 +155,24 @@ pub fn group(analyses: &[ScaffoldAnalysis]) -> Vec<ScaffoldGroup> {
     groups
 }
 
+/// Given scaffold keys for an already score-ranked result list (best first),
+/// returns the indices to keep so that at most one result survives per
+/// distinct scaffold — the highest-scoring one, since it's first in rank
+/// order. Acyclic hits (`scaffold_key == 0`, i.e. no ring scaffold at all)
+/// are never collapsed into each other: they're structurally unrelated
+/// molecules that only share the *absence* of a scaffold, so deduplicating
+/// them would discard real diversity rather than add it.
+pub fn diverse_indices(scaffold_keys: &[u64]) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut keep = Vec::new();
+    for (i, &key) in scaffold_keys.iter().enumerate() {
+        if key == 0 || seen.insert(key) {
+            keep.push(i);
+        }
+    }
+    keep
+}
+
 fn empty_analysis(heavy_atoms: u32) -> ScaffoldAnalysis {
     ScaffoldAnalysis {
         scaffold_smiles: String::new(),
@@ -735,5 +753,37 @@ mod tests {
         assert_eq!(a.ring_systems, 1);
         // Must itself re-parse without panicking.
         let _ = analyze(&a.scaffold_smiles);
+    }
+
+    #[test]
+    fn diverse_indices_keeps_first_hit_per_scaffold() {
+        // Rank order is score order: benzene-ring hit at 0 outranks the
+        // later toluene/aspirin hits sharing the same scaffold_key.
+        let keys = [10, 20, 10, 30, 20, 10];
+        assert_eq!(diverse_indices(&keys), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn diverse_indices_never_collapses_scaffold_free_hits() {
+        // Every zero-key (acyclic) hit is its own scaffold, so all survive,
+        // even though a real (non-zero) repeated key in the same list still
+        // gets deduplicated down to its first occurrence.
+        let keys = [0, 5, 0, 0, 5];
+        assert_eq!(diverse_indices(&keys), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn diverse_indices_on_real_molecules_preserves_rank_and_dedups() {
+        let analyses: Vec<ScaffoldAnalysis> = [
+            "CC(=O)Oc1ccccc1C(=O)O", // aspirin -> benzene scaffold (best-ranked)
+            "Cc1ccccc1",             // toluene -> same benzene scaffold, ranked lower
+            "c1ccc2ccccc2c1",        // naphthalene -> distinct scaffold
+            "CCO",                   // acyclic -> always kept
+        ]
+        .iter()
+        .map(|s| analyze(s))
+        .collect();
+        let keys: Vec<u64> = analyses.iter().map(|a| a.scaffold_key).collect();
+        assert_eq!(diverse_indices(&keys), vec![0, 2, 3]);
     }
 }

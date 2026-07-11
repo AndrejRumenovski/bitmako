@@ -482,7 +482,7 @@ fn cmd_build_prop_store(args: &[String]) -> Result<()> {
 }
 
 /// `search --index <index.bitmako> --skip <index.skip> --fp-store <store.fp> --query <SMILES>`
-/// Optional: `--lance <dataset.lance>` `--threshold 0.7` `--top-k 50` `--mw-max 500` `--logp-max 5`
+/// Optional: `--lance <dataset.lance>` `--threshold 0.7` `--top-k 50` `--mw-max 500` `--logp-max 5` `--diverse`
 ///
 /// Without `--lance`, prints doc_id + Tanimoto score only.
 /// With `--lance`, resolves each doc_id to compound_id, SMILES, and molecular properties
@@ -493,6 +493,12 @@ fn cmd_build_prop_store(args: &[String]) -> Result<()> {
 ///     no over-fetch, no Lance dependency at search time.
 ///   - `--lance <dataset.lance>` (fallback): WAND over-fetches 20× and a post-filter pass
 ///     drops non-matching candidates until top_k pass through.
+///
+/// `--diverse` (requires `--lance`, since it needs scaffolds): instead of the raw
+/// Tanimoto-ranked top_k, keeps only the best-scoring hit per distinct Bemis-Murcko
+/// scaffold — so top_k spans as many different chemical cores as the candidate pool
+/// allows, rather than being dominated by close analogs of the same one. See
+/// `bitmako::search::scaffold::diverse_indices`.
 fn cmd_search(args: &[String]) -> Result<()> {
     let index_path = PathBuf::from(require_flag(args, "--index"));
     let skip_path = PathBuf::from(require_flag(args, "--skip"));
@@ -505,6 +511,12 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let lance_path: Option<String> = flag_value(args, "--lance");
     let prop_store_path: Option<String> = flag_value(args, "--prop-store");
     let print_stats = args.iter().any(|a| a == "--stats");
+    let diverse = args.iter().any(|a| a == "--diverse");
+
+    if diverse && lance_path.is_none() {
+        eprintln!("error: --diverse requires --lance <dataset.lance> (scaffolds need SMILES)");
+        process::exit(1);
+    }
 
     let index = IndexReader::open(&index_path)?;
     info!("Loaded index: {} compounds", index.num_compounds);
@@ -595,19 +607,29 @@ fn cmd_search(args: &[String]) -> Result<()> {
             let smiles_list: Vec<String> = resolved.iter().map(|r| r.smiles.clone()).collect();
             let scaffolds = searcher.scaffold_results(&smiles_list);
 
-            // Walk candidates in descending score order; apply property filters; stop at top_k.
-            let mut shown = 0usize;
+            // Candidates in descending score order (WAND's native order), restricted
+            // to those passing the property filter, if any.
+            let mut eligible: Vec<usize> = (0..results.len())
+                .filter(|&i| !use_lance_filter || query.filter_passes(&resolved[i].properties))
+                .collect();
+            let eligible_count = eligible.len();
+
+            // --diverse: collapse same-scaffold candidates down to their
+            // best-scoring (first, since `eligible` is still score-ranked)
+            // representative before truncating to top_k.
+            if diverse {
+                let keys: Vec<u64> = eligible.iter().map(|&i| scaffolds[i].scaffold_key).collect();
+                let keep = bitmako::search::scaffold::diverse_indices(&keys);
+                eligible = keep.into_iter().map(|k| eligible[k]).collect();
+            }
+
             let mut shown_scaffolds = Vec::new();
-            for ((((_, score), r), a), sc) in
-                results.iter().zip(resolved.iter()).zip(analyses.iter()).zip(scaffolds.iter())
-            {
-                if use_lance_filter && !query.filter_passes(&r.properties) {
-                    continue;
-                }
-                shown += 1;
+            for (shown, &i) in eligible.iter().take(top_k).enumerate() {
+                let (_, score) = results[i];
+                let r = &resolved[i];
                 println!(
                     "#{}: compound={} score={:.4} smiles={} mw={:.1} logp={:.2} rot_bonds={} heavy_atoms={} rings={}",
-                    shown,
+                    shown + 1,
                     r.compound_id,
                     score,
                     r.smiles,
@@ -617,16 +639,21 @@ fn cmd_search(args: &[String]) -> Result<()> {
                     r.properties.heavy_atoms,
                     r.properties.ring_count,
                 );
-                print_similarity_analysis(a);
-                print_scaffold_analysis(sc);
-                shown_scaffolds.push(sc.clone());
-                if shown == top_k {
-                    break;
-                }
+                print_similarity_analysis(&analyses[i]);
+                print_scaffold_analysis(&scaffolds[i]);
+                shown_scaffolds.push(scaffolds[i].clone());
             }
 
             if use_lance_filter {
-                println!("({} of {} WAND candidates passed property filter)", shown, results.len());
+                println!("({} of {} WAND candidates passed property filter)", eligible_count, results.len());
+            }
+            if diverse {
+                println!(
+                    "(--diverse: {} eligible candidates span {} distinct scaffolds; showing top {})",
+                    eligible_count,
+                    eligible.len(),
+                    shown_scaffolds.len()
+                );
             }
             print_scaffold_summary(&shown_scaffolds);
 

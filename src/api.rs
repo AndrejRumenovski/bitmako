@@ -44,6 +44,11 @@ struct SearchRequest {
     top_k: usize,
     mw_max: Option<f32>,
     logp_max: Option<f32>,
+    /// Collapse same-scaffold hits down to their best-scoring representative
+    /// before returning — requires `lance` to be attached (scaffolds need
+    /// SMILES). See `search::scaffold::diverse_indices`.
+    #[serde(default)]
+    diverse: bool,
 }
 
 fn default_threshold() -> f32 {
@@ -168,6 +173,9 @@ async fn handle_search(
             "mw_max/logp_max require the server to be started with --prop-store",
         ));
     }
+    if req.diverse && state.lance.is_none() {
+        return Err(bad_request("diverse requires the server to be started with --lance"));
+    }
 
     let query_fp = compute_morgan_fp(&req.smiles);
     let query = SimilarityQuery::new(query_fp, req.threshold, req.top_k)
@@ -224,6 +232,22 @@ async fn handle_search(
             .into_iter()
             .map(|g| ScaffoldGroupItem { scaffold_smiles: g.scaffold_smiles, scaffold_key: g.scaffold_key, count: g.count })
             .collect();
+    }
+
+    // Diversity picking: keep only the best-scoring (first, since `items` is
+    // still score-ranked) hit per distinct scaffold. Post-processes the same
+    // top-k WAND already returned rather than over-fetching for a fuller
+    // MaxMin-style pick, so a diverse response can come back shorter than
+    // `top_k` — same tradeoff as the `search --diverse` CLI flag.
+    if req.diverse {
+        let keys: Vec<u64> = items.iter().map(|it| it.scaffold_key.unwrap_or(0)).collect();
+        let keep: std::collections::HashSet<usize> = scaffold::diverse_indices(&keys).into_iter().collect();
+        let mut i = 0;
+        items.retain(|_| {
+            let keep_this = keep.contains(&i);
+            i += 1;
+            keep_this
+        });
     }
 
     Ok(Json(SearchResponse {
