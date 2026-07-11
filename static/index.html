@@ -935,6 +935,15 @@
       var detailRow = btn.closest('tr').nextElementSibling;
       var expanded = detailRow.classList.toggle('open');
       btn.setAttribute('aria-expanded', String(expanded));
+      if (expanded) {
+        // The toggle sits in the table's rightmost column, so focusing it
+        // (a normal side effect of the click) makes the browser auto-scroll
+        // #results-wrap to keep the button in view — which then clips the
+        // panel that just opened, since its content is meant to be read
+        // from the left edge, not from wherever the toggle happens to sit.
+        // Reset synchronously so the panel always opens fully visible.
+        els.resultsWrap.scrollLeft = 0;
+      }
     });
 
     els.resultsWrap.appendChild(table);
