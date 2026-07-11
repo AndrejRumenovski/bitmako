@@ -23,6 +23,7 @@
 - [Architecture Overview](#architecture-overview)
 - [Similarity Analysis](#similarity-analysis)
 - [Search Statistics](#search-statistics)
+- [Scaffold Analysis, Diversity Picking & R-Group Decomposition](#scaffold-analysis-diversity-picking--r-group-decomposition)
 - [Design Decisions](#design-decisions)
 - [Engineering Challenges](#engineering-challenges)
 - [Benchmark Results](#benchmark-results)
@@ -157,6 +158,19 @@ the R-groups stripped to reach it, without cluttering the default table view:
   and average/maximum similarity for the query that just ran. Built almost
   entirely from data the API was already returning; no charts, no history,
   just the current query's own numbers.
+- **Bemis-Murcko scaffold extraction & grouping** — every result's ring
+  system + linkers, reduced from the molecular graph's 2-core with no
+  separate ring-perception pass, canonicalized via iterative color
+  refinement so a shared scaffold hashes identically regardless of how its
+  SMILES was written. See [Scaffold Analysis, Diversity Picking & R-Group
+  Decomposition](#scaffold-analysis-diversity-picking--r-group-decomposition).
+- **Scaffold-based diversity picking** (`--diverse`) — collapses same-core
+  hits down to their best-scoring representative, so a result set spans as
+  many distinct chemical cores as the candidate pool allows.
+- **R-group decomposition & SAR tables** — each result's substituents,
+  aligned across every result sharing a scaffold into consistent R1/R2/…
+  columns by attachment position — the classic structure-activity-relationship
+  table, computed automatically.
 - **Memory-bounded index construction** — multi-pass builder trades peak RAM
   against pass count, so a 70 GB index can be built without loading it whole.
 - **Verified-exact streaming search** — the skip-cursor implementation is
@@ -371,6 +385,174 @@ just the current query's own numbers, matching the existing UI's restrained,
 instrument-readout aesthetic rather than turning the page into an analytics
 dashboard.
 
+## Scaffold Analysis, Diversity Picking & R-Group Decomposition
+
+A Tanimoto score ranks hits; it doesn't tell a chemist the thing they
+actually reason about next — which hits share the same chemical *core*
+(the classic lead-identification and scaffold-hopping questions from
+[The Problem](#the-problem)), and what varies at the positions that differ.
+Three features answer that, all built on the same foundation and all gated
+on `--lance` (they need each candidate's SMILES text, not just its
+fingerprint):
+
+**Real example**, captured live against the 1.36B-compound corpus — query
+`CC(=O)Oc1ccccc1O` (2-acetoxyphenol, a catechol mono-acetate ester),
+threshold 0.2, top-10:
+
+### Bemis-Murcko scaffold extraction
+
+For each result, the ring systems plus the atoms linking them, with
+terminal substituents stripped away:
+
+| Field | Meaning |
+|---|---|
+| `scaffold_smiles` | The scaffold, rendered as SMILES; empty if the molecule is acyclic |
+| `ring_systems` | Distinct fused-ring clusters (biphenyl's two rings = 2; naphthalene's fused pair = 1) |
+| `ring_count` | Total independent rings across all ring systems |
+| `scaffold_atoms` / `linker_atoms` | Atoms retained overall, and how many of those are non-ring bridges |
+| `framework_fraction` | `scaffold_atoms / heavy_atoms` — how much of the molecule is core vs. side chain |
+| `scaffold_key` | A stable hash of the scaffold's *graph structure*, not its display string — identical for two molecules sharing a scaffold regardless of how their SMILES was written |
+
+The algorithm needs no separate ring-perception pass: the Bemis-Murcko
+framework is exactly the molecular graph's **2-core** (iteratively strip
+every atom with degree ≤ 1 until none remain). **Tarjan bridge-finding**
+over what's left classifies each edge as ring or linker. **Iterative color
+refinement** (1-Weisfeiler-Leman — the same "hash your neighborhood, repeat"
+idea the ECFP4 fingerprinter itself uses) assigns each atom a canonical
+color from its structure alone, never its position in the original SMILES
+string; `scaffold_key` is hashed from that color histogram plus the
+edge-color multiset, which is what makes it stable across relabelings —
+verified directly in the test suite: `analyze("c1ccccc1")`,
+`analyze("Cc1ccccc1")` (toluene), and the benzene ring inside aspirin's own
+SMILES all hash to the *same* `scaffold_key`, despite being three
+differently-written molecules.
+
+Result #1 from the live run: `CC(=O)O[C@H]1CC[C@@H]1C(=O)OCC1CCC(=O)N1`
+(score 0.2917) reduces to scaffold `C1CC(C1)COCC2CCCN2` — 2 ring systems,
+12 scaffold atoms, 67% of the molecule is core. Across all 10 results, the
+CLI also prints a grouping summary:
+
+```
+10 results span 9 distinct scaffolds
+  C1=CC=CC=C1 × 2
+  C1CC(C1)COC2=CC=CC=C2 × 1
+  C1CC(C1)COCC2=CC=CC=C2 × 1
+  ...
+```
+
+### Diversity picking (`--diverse` / `"diverse": true`)
+
+Ten close analogs of the same core tell a chemist less than ten hits
+spanning ten different cores. `--diverse` collapses same-scaffold hits down
+to their single best-scoring representative — `scaffold::diverse_indices`
+walks the already score-ranked result list and keeps the first (i.e.
+highest-scoring) occurrence of each `scaffold_key`, dropping the rest.
+Acyclic hits (`scaffold_key == 0`) are never collapsed into each other —
+they're structurally unrelated molecules that only share the *absence* of a
+scaffold, so merging them would erase real diversity rather than add it.
+
+On the live query above, results #7 and #10 were the only pair sharing a
+scaffold (a bare benzene ring, `C1=CC=CC=C1`). Re-running with `--diverse`:
+
+```
+(--diverse: 10 eligible candidates span 9 distinct scaffolds; showing top 9)
+9 results span 9 distinct scaffolds
+  C1=CC=CC=C1 × 1
+  ...
+```
+
+— #10 dropped, #7 (the higher-scoring of the pair) kept, every remaining
+scaffold now appears exactly once. This is a deliberately simple pick, not
+a fingerprint-based MaxMin/Taylor-Butina diversity selector: it post-processes
+the same top-k WAND already returned rather than over-fetching for a fuller
+selection, so a diverse response can come back shorter than `top_k` — the
+tradeoff is explicit in both the CLI's summary line and the API response's
+shorter `results` array.
+
+### R-group decomposition & SAR tables
+
+The complement to "what's the shared core": *what varies*. `decompose`
+splits a molecule into its scaffold plus the substituents removed to reach
+it, each tagged with where it attaches. This falls out of the 2-core
+definition almost for free: since any ring survives the 2-core reduction,
+every atom the reduction *strips* is necessarily part of an acyclic
+fragment, and that fragment touches the scaffold at exactly one bond (a
+second attachment point would put its atoms on a cycle, and cycles survive
+the 2-core) — so "one dead connected component" and "one R-group" coincide
+exactly, no extra bookkeeping required to tell them apart.
+
+Result #1's three R-groups, from the live run:
+
+```
+r_groups: C: *OC(C)=O, C: *=O, C: *=O
+```
+
+(an acetate ester and two exocyclic carbonyl oxygens — the lactam ring's
+`C=O` and the linker ester's `C=O` are both, correctly, outside the
+Bemis-Murcko ring skeleton under this definition, not silently dropped).
+
+The more interesting piece is **aligning substituents across molecules that
+share a scaffold** into an actual SAR table — `r_group_tables` builds one
+per scaffold shared by 2+ results, with columns keyed by each substituent's
+`attach_color`: the same canonical 1-Weisfeiler-Leman color scaffold
+extraction already computes, which is provably stable across any two
+molecules sharing that scaffold. Two positions with the same color are the
+same structural attachment point no matter which molecule they came from —
+that's the column; two positions that happen to be graph-symmetric (like
+every position on a bare benzene ring) collapse into the *same* column,
+which the test suite checks explicitly (2- vs. 3-methylpyridine align into
+two separate columns since pyridine's nitrogen breaks the ring's symmetry;
+toluene and benzoic acid's substituents land in the *same* single column,
+since benzene has none).
+
+On the live query, results #7 and #10 (the shared-benzene-scaffold pair
+from above) produce exactly one such table:
+
+```json
+{
+  "scaffold_smiles": "C1=CC=CC=C1",
+  "columns": [{ "label": "R1", "attach_symbol": "C" }],
+  "rows": [
+    { "member_index": 6, "cells": [["*F", "*F", "*SCCOC(C)=O"]] },
+    { "member_index": 9, "cells": [["*F", "*F", "*OCCOC(C)=O"]] }
+  ]
+}
+```
+
+Both molecules' three substituents collapse into the single `R1` column
+because benzene's full symmetry gives every ring position the same color —
+a documented simplification, not a bug: disambiguating symmetric positions
+by their substituents would need a second refinement pass this module
+deliberately doesn't do.
+
+### Where these live, and why they don't affect search performance
+
+All three are pure functions of a SMILES string in `src/search/scaffold.rs`
+— it doesn't know about `Searcher`, Lance, or HTTP, and reuses
+`etl::fingerprint`'s existing SMILES→graph parser (`pub(crate)`-exposed for
+exactly this) rather than adding a third independent SMILES scanner. 23 unit
+tests cover the graph algorithms directly: canonicalization invariance,
+ring-system/linker counting on hand-picked molecules (naphthalene, biphenyl,
+charged rings), R-group extraction and its determinism, and both alignment
+cases above. `Searcher::scaffold_results`/`rgroup_results` are the only
+glue — same shape as `analyze_results` (see
+[Similarity Analysis](#similarity-analysis)): given SMILES a caller already
+resolved via Lance, map the pure function over them. Like Similarity
+Analysis, this runs once over the (small) already-ranked top-k list, never
+inside `BmwEngine`'s pivot loop — a 2-core reduction and a handful of
+Weisfeiler-Leman refinement rounds over a few dozen atoms, tens to a few
+hundred times per query, has no measurable effect on WAND's own pruning or
+the [Benchmark Results](#benchmark-results) numbers.
+
+**Scope:** wired into `search` (always shown with `--lance`, no flag — same
+gating as Similarity Analysis; `--diverse` is opt-in), `POST /search` (see
+[API Documentation](#api-documentation)), and the web UI (a Scaffold +
+R-Groups block in each result's Analysis panel, plus collapsible
+"Scaffolds"/"R-Groups" summary panels above the results table). Not wired
+into `search-batch` — an SAR table doesn't fit a tabular bulk-export format,
+and the same `scaffold`/`decompose`/`r_group_tables` functions are one
+import away for anyone scripting against the library directly.
+
 ## Design Decisions
 
 - **Exact results over approximate nearest neighbors.** Approximate
@@ -533,6 +715,13 @@ bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compou
     --query "OC(=O)c1ccccc1" --threshold 0.1 --top-k 10 \
     --mw-max 350 --logp-max 3
 
+# 6e. Diverse results — one best-scoring hit per distinct scaffold, plus
+#     scaffold/R-group/SAR-table output (requires --lance; see Scaffold
+#     Analysis, Diversity Picking & R-Group Decomposition)
+bitmako search --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
+    --lance compounds.lance \
+    --query "OC(=O)c1ccccc1" --threshold 0.1 --top-k 10 --diverse
+
 # 7. Batch search — one query per line of a .smi file ("SMILES [ID]"), run in
 #    parallel across CPU cores against a single shared Searcher
 bitmako search-batch --index compounds.bitmako --skip compounds.skip --fp-store compounds.fp \
@@ -610,11 +799,12 @@ and generated explanation — without cluttering the default table view.
 
 ```json
 {
-  "smiles": "OC(=O)c1ccccc1",
-  "threshold": 0.3,
+  "smiles": "CC(=O)Oc1ccccc1O",
+  "threshold": 0.2,
   "top_k": 10,
   "mw_max": 350,
-  "logp_max": 3
+  "logp_max": 3,
+  "diverse": false
 }
 ```
 
@@ -625,33 +815,60 @@ and generated explanation — without cluttering the default table view.
 | `top_k` | integer | no | `50` | Max results returned |
 | `mw_max` | float | no | — | Requires server started with `--prop-store` |
 | `logp_max` | float | no | — | Requires server started with `--prop-store` |
+| `diverse` | bool | no | `false` | Requires `--lance`; see [Diversity Picking](#scaffold-analysis-diversity-picking--r-group-decomposition) |
 
-**Response body**
+**Response body** — real output from the live 1.36B-compound corpus
+(trimmed to one result; full response has 10):
 
 ```json
 {
-  "query_smiles": "OC(=O)c1ccccc1",
-  "query_pop": 37,
+  "query_smiles": "CC(=O)Oc1ccccc1O",
+  "query_pop": 24,
   "results": [
     {
-      "doc_id": 123,
-      "score": 0.87,
-      "compound_id": "Z...",
-      "smiles": "...",
-      "mw": 180.16,
-      "logp": 1.2,
-      "rot_bonds": 1,
-      "heavy_atoms": 13,
-      "ring_count": 1,
-      "shared_bits": 32,
-      "query_unique_bits": 5,
-      "candidate_unique_bits": 0,
-      "explanation": "This molecule shares 87% of its structural fingerprint with the query (32 of 37 total bits), indicating a high degree of structural similarity. 5 bits appear only in the query and 0 bits appear only in this molecule."
+      "doc_id": 14324478,
+      "score": 0.29166666,
+      "compound_id": "m_1458____26632154____483316",
+      "smiles": "CC(=O)O[C@H]1CC[C@@H]1C(=O)OCC1CCC(=O)N1 |&1:4,7|",
+      "mw": 293.56848,
+      "logp": 0.48920006,
+      "rot_bonds": 15,
+      "heavy_atoms": 18,
+      "ring_count": 2,
+      "shared_bits": 14,
+      "query_unique_bits": 10,
+      "candidate_unique_bits": 24,
+      "explanation": "This molecule shares 29% of its structural fingerprint with the query (14 of 48 total bits), indicating a low but notable degree of structural similarity. 10 bits appear only in the query and 24 bits appear only in this molecule.",
+      "scaffold_smiles": "C1CC(C1)COCC2CCCN2",
+      "ring_systems": 2,
+      "scaffold_atoms": 12,
+      "framework_fraction": 0.6666667,
+      "scaffold_key": 7478615160394783303,
+      "r_groups": [
+        { "attach_symbol": "C", "smiles": "*OC(C)=O" },
+        { "attach_symbol": "C", "smiles": "*=O" },
+        { "attach_symbol": "C", "smiles": "*=O" }
+      ]
     }
   ],
-  "docs_evaluated": 45,
-  "eval_fraction_pct": 0.0000033,
-  "search_time_ms": 142.3
+  "docs_evaluated": 82,
+  "eval_fraction_pct": 0.00000601,
+  "search_time_ms": 25889.4,
+  "scaffold_groups": [
+    { "scaffold_smiles": "C1=CC=CC=C1", "scaffold_key": 16382034509723789546, "count": 2 },
+    { "scaffold_smiles": "C1CC(C1)COC2=CC=CC=C2", "scaffold_key": 6116877318683855719, "count": 1 }
+  ],
+  "rgroup_tables": [
+    {
+      "scaffold_key": 16382034509723789546,
+      "scaffold_smiles": "C1=CC=CC=C1",
+      "columns": [{ "label": "R1", "attach_symbol": "C" }],
+      "rows": [
+        { "member_index": 6, "cells": [["*F", "*F", "*SCCOC(C)=O"]] },
+        { "member_index": 9, "cells": [["*F", "*F", "*OCCOC(C)=O"]] }
+      ]
+    }
+  ]
 }
 ```
 
@@ -664,7 +881,14 @@ present regardless of `--lance`, since they're derived purely from the
 fingerprints. `search_time_ms` is wall-clock time around the WAND search
 itself (see [Search Statistics](#search-statistics)) — match count and
 average/maximum similarity aren't separate fields since they're one pass
-over `results` away for any caller.
+over `results` away for any caller. `scaffold_*`/`r_groups` fields and the
+top-level `scaffold_groups`/`rgroup_tables` arrays are the
+[Scaffold Analysis, Diversity Picking & R-Group Decomposition](#scaffold-analysis-diversity-picking--r-group-decomposition)
+fields — empty/absent without `--lance`; `rgroup_tables` in particular is
+only non-empty when at least two returned results share a scaffold (in the
+example above, results #7 and #10 — `member_index` 6 and 9 — are the only
+such pair, out of 10). `scaffold_groups` is also trimmed above — the real
+response has 9 entries, one per distinct scaffold across the 10 results.
 
 **Error responses** — HTTP 400 with a JSON body, for: out-of-range
 threshold, unparseable SMILES, `top_k=0`, or property filters requested
