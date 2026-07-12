@@ -833,14 +833,14 @@
       parts.push(
         '<button type="button" class="summary-link" data-toggle="scaffolds" aria-expanded="false">' +
         fmtInt(resp.scaffold_groups.length) + ' shared core' + (resp.scaffold_groups.length === 1 ? '' : 's') +
-        ' found</button>'
+        ' found</button> (scaffolds)'
       );
     }
     if (resp.rgroup_tables && resp.rgroup_tables.length > 0) {
       parts.push(
         '<button type="button" class="summary-link" data-toggle="rgroups" aria-expanded="false">' +
         fmtInt(resp.rgroup_tables.length) + ' comparison table' + (resp.rgroup_tables.length === 1 ? '' : 's') +
-        '</button>'
+        '</button> (R-groups)'
       );
     }
 
