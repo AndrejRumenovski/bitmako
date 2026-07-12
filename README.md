@@ -13,7 +13,7 @@
 
 **Demo — a live search against the full 1.36B-compound corpus:**
 
-https://github.com/user-attachments/assets/86d9def0-7e69-4396-aad2-8ba4793e4efb
+https://github.com/user-attachments/assets/b7a3ae47-b750-4be1-b3d3-0552dba6d220
 
 ---
 
