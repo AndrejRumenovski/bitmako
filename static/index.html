@@ -87,6 +87,32 @@
     font-weight: 600;
   }
 
+  /* The one sentence that has to work with zero chemistry/CS background —
+     read before any jargon on the page. Plain sans, not bold, so it reads
+     as an explanation rather than a second headline. */
+  .intro-line {
+    margin: 24px 0 0;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink-muted);
+    max-width: 640px;
+  }
+
+  /* Reused everywhere a technical label needs an always-visible, one-clause
+     plain-language explanation underneath it: form fields, stat labels,
+     table headers, analysis-panel labels. Deliberately small and muted so
+     it reads as a caption, not a second label competing with the real one. */
+  .hint {
+    display: block;
+    font-family: var(--sans);
+    font-weight: 400;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--ink-muted);
+    margin-top: 2px;
+    white-space: normal;
+  }
+
   /* ---------- search form ---------- */
 
   .eyebrow {
@@ -117,12 +143,18 @@
 
   .params {
     display: flex;
-    align-items: flex-end;
+    /* Top-aligned, not bottom-aligned: every field now carries a hint line
+       of varying length under its input, so aligning to each item's bottom
+       edge would leave the inputs themselves at ragged heights. Buttons get
+       a matching invisible spacer (see .param-button) to land at the same
+       height as the inputs despite having no label/hint of their own. */
+    align-items: flex-start;
     gap: 28px;
     flex-wrap: wrap;
     margin-top: 24px;
   }
 
+  .param { max-width: 170px; }
   .param label { display: block; }
 
   .param input {
@@ -136,6 +168,11 @@
     color: var(--ink);
     outline: none;
   }
+
+  /* Invisible spacer matching the .eyebrow label's height/margin, so a
+     button with no label of its own still lands at the same vertical
+     position as the labeled inputs beside it once .params is top-aligned. */
+  .param-button .eyebrow { visibility: hidden; }
 
   .param input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px var(--teal-dim); }
   .param input:disabled { color: #B7C0BF; background: #EEF1F0; }
@@ -187,8 +224,9 @@
   }
   .param-check input:disabled + label { color: var(--ink-muted); cursor: default; }
 
+  .push-right { margin-left: auto; }
+
   button#search-btn {
-    margin-left: auto;
     font-family: var(--sans);
     font-weight: 600;
     font-size: 14px;
@@ -225,18 +263,24 @@
   }
   #empty-box.show { display: block; }
 
-  /* ---------- search statistics dashboard ---------- */
+  /* ---------- search statistics ---------- */
 
+  /* Only one stat gets the dramatic treatment: how much of a billion-scale
+     corpus WAND actually had to touch. Everything else (match count, time,
+     similarity, fingerprint type, scaffold/R-group links) is deliberately
+     small and secondary underneath it, in #results-summary — the same
+     relationship Google's results page has between its result count and
+     its "(0.45 seconds)" aside. Time specifically is never its own
+     headline number; a multi-second wall-clock figure dominated by cold
+     disk reads on this hardware would undersell "seconds, at billion-scale"
+     if it were given equal visual weight to the pruning-ratio stat. */
   #stats-dashboard {
     display: none;
-    flex-wrap: wrap;
-    align-items: flex-start;
-    gap: 24px 40px;
     padding: 28px 0 24px;
     border-bottom: 1px solid var(--rule);
     margin-top: 40px;
   }
-  #stats-dashboard.show { display: flex; }
+  #stats-dashboard.show { display: block; }
 
   .stat-cell { min-width: 96px; }
 
@@ -260,8 +304,6 @@
     line-height: 1.15;
   }
 
-  .stat-value.text { font-size: 14px; font-weight: 600; }
-
   .stat-caption {
     display: block;
     margin-top: 3px;
@@ -271,35 +313,42 @@
   }
   .stat-caption .frac { font-family: var(--mono); color: var(--ink); }
 
-  /* The one stat worth making dramatic: how much of a billion-scale corpus
-     WAND actually had to touch. Same amber-hero treatment the old standalone
-     readout used, now folded into the compact dashboard as its lead cell. */
-  .stat-cell--hero {
-    min-width: 220px;
-  }
   .stat-cell--hero .stat-value {
     color: var(--amber);
     font-size: clamp(26px, 5vw, 38px);
   }
+  .stat-cell--hero .hint { max-width: 480px; }
 
-  /* The "Scaffolds" and "R-Groups" stat cells double as toggles for the
-     breakdown panel below them — styled like the other stat values but a
-     real <button>, since they're interactive. Hidden entirely without
-     --lance (both need SMILES; see the per-result gating below). */
-  .stat-toggle {
+  /* The small Google-style aside: match count, time, similarity,
+     fingerprint type, and (when present) links to the scaffold/R-group
+     breakdowns — all in one quiet line under the hero stat. */
+  .results-summary {
+    margin: 14px 0 0;
+    font-family: var(--sans);
+    font-size: 13px;
+    color: var(--ink-muted);
+    line-height: 1.6;
+  }
+  .results-summary strong { color: var(--ink); font-weight: 600; }
+
+  /* Scaffolds/R-Groups open their breakdown panels — styled as small
+     inline links within the summary line rather than the large standalone
+     buttons this used to be, so they read as "more detail available", not
+     as headline stats of their own. */
+  .summary-link {
     background: none;
     border: none;
     padding: 0;
     margin: 0;
-    font-family: var(--mono);
-    font-weight: 700;
-    font-size: 22px;
-    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--teal);
     cursor: pointer;
     text-decoration: underline dotted;
-    text-underline-offset: 4px;
+    text-underline-offset: 3px;
   }
-  .stat-toggle:hover { color: var(--teal); }
+  .summary-link:hover { color: #0B655F; }
 
   #scaffold-groups-panel {
     display: none;
@@ -307,6 +356,16 @@
     border-bottom: 1px solid var(--rule);
   }
   #scaffold-groups-panel.open { display: block; }
+
+  /* One-line plain-language framing at the top of the Scaffolds/R-Groups
+     panels, above whatever rows/tables follow. */
+  .panel-note {
+    margin: 0 0 16px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--ink-muted);
+    max-width: 560px;
+  }
 
   .scaffold-group-row {
     display: flex;
@@ -400,6 +459,20 @@
     white-space: nowrap;
   }
 
+  /* Every column header gets a plain-English primary word (above, uppercase
+     as before) plus the real technical term/unit underneath it in normal
+     case — same dual-labeling pattern as the form fields and stat cells. */
+  #results th .th-hint {
+    display: block;
+    margin-top: 3px;
+    font-weight: 400;
+    font-size: 10px;
+    letter-spacing: normal;
+    text-transform: none;
+    color: var(--ink-muted);
+    opacity: 0.85;
+  }
+
   #results td {
     padding: 10px 12px 10px 0;
     border-bottom: 1px solid var(--rule);
@@ -470,7 +543,7 @@
     white-space: normal;
   }
 
-  .analysis-panel { max-width: 640px; }
+  .analysis-panel { max-width: 760px; }
 
   .analysis-stats {
     display: flex;
@@ -479,7 +552,7 @@
     margin-bottom: 14px;
   }
 
-  .analysis-stat { min-width: 110px; }
+  .analysis-stat { min-width: 150px; max-width: 200px; }
 
   .analysis-stat-label {
     display: block;
@@ -573,7 +646,8 @@
   @media (max-width: 560px) {
     header.masthead { padding-top: 28px; }
     .params { gap: 20px; }
-    button#search-btn { margin-left: 0; width: 100%; }
+    .push-right { margin-left: 0; }
+    button#search-btn { width: 100%; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -594,37 +668,57 @@
     <div class="corpus-count" id="corpus-count">connecting…</div>
   </header>
 
+  <p class="intro-line">Search a library of over a billion molecules to find
+    ones with a structure similar to one you describe — like a reverse-image
+    search, but for chemical structures.</p>
+
   <form id="search-form">
-    <span class="eyebrow">SMILES</span>
+    <span class="eyebrow">Molecule (SMILES)</span>
     <input id="smiles" name="smiles" type="text" autocomplete="off" spellcheck="false"
            placeholder="CC(=O)Oc1ccccc1C(=O)O" required>
+    <span class="hint">A short text code for a molecule's structure — type
+      one in, and the search finds molecules that look structurally similar.</span>
 
     <div class="params">
       <div class="param">
-        <span class="eyebrow">Threshold</span>
+        <span class="eyebrow">Minimum similarity</span>
         <input id="threshold" type="number" min="0" max="1" step="any" value="0.7">
+        <span class="hint">0 = anything, 1 = an exact structural match.</span>
       </div>
       <div class="param">
-        <span class="eyebrow">Top K</span>
+        <span class="eyebrow">Max results</span>
         <input id="top_k" type="number" min="1" max="500" step="1" value="20">
+        <span class="hint">How many matches to show.</span>
       </div>
-      <button type="button" id="advanced-toggle">+ property filters</button>
-      <button type="submit" id="search-btn">Search</button>
+      <div class="param param-button">
+        <span class="eyebrow" aria-hidden="true">&nbsp;</span>
+        <button type="button" id="advanced-toggle">+ filter by size / solubility</button>
+      </div>
+      <div class="param param-button push-right">
+        <span class="eyebrow" aria-hidden="true">&nbsp;</span>
+        <button type="submit" id="search-btn">Search</button>
+      </div>
     </div>
 
     <div class="params" id="advanced-row">
       <div class="param">
         <span class="eyebrow">MW max</span>
         <input id="mw_max" type="number" min="0" step="any" placeholder="none">
+        <span class="hint">Molecular weight limit — a rough measure of size.</span>
       </div>
       <div class="param">
         <span class="eyebrow">LogP max</span>
         <input id="logp_max" type="number" step="any" placeholder="none">
+        <span class="hint">Limits how fat-soluble vs. water-soluble it is.</span>
       </div>
       <div class="prop-note" id="prop-note"></div>
-      <div class="param param-check">
-        <input id="diverse" type="checkbox">
-        <label for="diverse">Diverse results</label>
+      <div class="param">
+        <div class="param-check">
+          <input id="diverse" type="checkbox">
+          <label for="diverse">Diverse results</label>
+        </div>
+        <span class="hint">Skip near-duplicates so results cover more
+          distinct structures.</span>
       </div>
       <div class="prop-note" id="diverse-note"></div>
     </div>
@@ -635,40 +729,19 @@
 
   <section id="stats-dashboard" aria-label="Search statistics">
     <div class="stat-cell stat-cell--hero">
-      <span class="stat-label">Molecules Searched</span>
+      <span class="stat-label">Molecules Checked</span>
       <span class="stat-value" id="stat-searched">—</span>
       <span class="stat-caption" id="stat-searched-caption"></span>
+      <span class="hint">The engine skips everything that provably can't
+        match, so it only has to look closely at a tiny handful — not the
+        whole library.</span>
     </div>
-    <div class="stat-cell">
-      <span class="stat-label">Matches</span>
-      <span class="stat-value" id="stat-matches">—</span>
-    </div>
-    <div class="stat-cell">
-      <span class="stat-label">Execution Time</span>
-      <span class="stat-value" id="stat-time">—</span>
-    </div>
-    <div class="stat-cell">
-      <span class="stat-label">Avg. Similarity</span>
-      <span class="stat-value" id="stat-avg">—</span>
-    </div>
-    <div class="stat-cell">
-      <span class="stat-label">Max Similarity</span>
-      <span class="stat-value" id="stat-max">—</span>
-    </div>
-    <div class="stat-cell">
-      <span class="stat-label">Fingerprint</span>
-      <span class="stat-value text" id="stat-fp">—</span>
-    </div>
-    <div class="stat-cell" id="stat-cell-scaffolds" style="display: none;">
-      <span class="stat-label">Scaffolds</span>
-      <button type="button" class="stat-toggle" id="stat-scaffolds" aria-expanded="false">—</button>
-      <span class="stat-caption" id="stat-scaffolds-caption"></span>
-    </div>
-    <div class="stat-cell" id="stat-cell-rgroups" style="display: none;">
-      <span class="stat-label">R-Groups</span>
-      <button type="button" class="stat-toggle" id="stat-rgroups" aria-expanded="false">—</button>
-      <span class="stat-caption" id="stat-rgroups-caption"></span>
-    </div>
+    <!-- Google-style: present, small, never competing with the hero stat
+         above. Built fresh each search by renderResultsSummary(); the
+         Scaffolds/R-Groups links inside it are handled by one delegated
+         click listener on this container (see below), same pattern as the
+         results table's own Analysis-toggle delegation. -->
+    <p id="results-summary" class="results-summary"></p>
   </section>
 
   <div id="scaffold-groups-panel" aria-label="Scaffold breakdown"></div>
@@ -707,18 +780,8 @@
     statsDashboard: document.getElementById('stats-dashboard'),
     statSearched: document.getElementById('stat-searched'),
     statSearchedCaption: document.getElementById('stat-searched-caption'),
-    statMatches: document.getElementById('stat-matches'),
-    statTime: document.getElementById('stat-time'),
-    statAvg: document.getElementById('stat-avg'),
-    statMax: document.getElementById('stat-max'),
-    statFp: document.getElementById('stat-fp'),
-    statCellScaffolds: document.getElementById('stat-cell-scaffolds'),
-    statScaffolds: document.getElementById('stat-scaffolds'),
-    statScaffoldsCaption: document.getElementById('stat-scaffolds-caption'),
+    resultsSummary: document.getElementById('results-summary'),
     scaffoldGroupsPanel: document.getElementById('scaffold-groups-panel'),
-    statCellRgroups: document.getElementById('stat-cell-rgroups'),
-    statRgroups: document.getElementById('stat-rgroups'),
-    statRgroupsCaption: document.getElementById('stat-rgroups-caption'),
     rgroupTablesPanel: document.getElementById('rgroup-tables-panel'),
     resultsWrap: document.getElementById('results-wrap'),
   };
@@ -750,6 +813,42 @@
     return { avg: sum / results.length, max: max };
   }
 
+  // The small, Google-style aside under the hero stat: match count, time,
+  // similarity, fingerprint type, and (when present) links into the
+  // scaffold/R-group breakdowns — one quiet line, rebuilt fresh each
+  // search, replacing what used to be five equal-weight stat-cells.
+  function renderResultsSummary(resp) {
+    var n = resp.results.length;
+    var parts = ['<strong>' + fmtInt(n) + '</strong> match' + (n === 1 ? '' : 'es')];
+    parts.push('in ' + fmtDuration(resp.search_time_ms));
+
+    var scores = scoreSummary(resp.results);
+    if (scores) {
+      parts.push('avg similarity ' + scores.avg.toFixed(2) + ' (best ' + scores.max.toFixed(2) + ')');
+    }
+    if (state.fingerprintType) {
+      parts.push(state.fingerprintType);
+    }
+    if (resp.scaffold_groups && resp.scaffold_groups.length > 0) {
+      parts.push(
+        '<button type="button" class="summary-link" data-toggle="scaffolds" aria-expanded="false">' +
+        fmtInt(resp.scaffold_groups.length) + ' shared core' + (resp.scaffold_groups.length === 1 ? '' : 's') +
+        ' found</button>'
+      );
+    }
+    if (resp.rgroup_tables && resp.rgroup_tables.length > 0) {
+      parts.push(
+        '<button type="button" class="summary-link" data-toggle="rgroups" aria-expanded="false">' +
+        fmtInt(resp.rgroup_tables.length) + ' comparison table' + (resp.rgroup_tables.length === 1 ? '' : 's') +
+        '</button>'
+      );
+    }
+
+    els.resultsSummary.innerHTML = parts.join(' &middot; ') +
+      '<span class="hint">&ldquo;Similarity&rdquo; means how closely a match’s structure ' +
+      'resembles yours, from 0 to 1 (an exact match).</span>';
+  }
+
   function showError(msg) {
     els.errorBox.textContent = msg;
     els.errorBox.classList.add('show');
@@ -767,14 +866,16 @@
     els.advRow.classList.toggle('open');
   });
 
-  els.statScaffolds.addEventListener('click', function () {
-    var open = els.scaffoldGroupsPanel.classList.toggle('open');
-    els.statScaffolds.setAttribute('aria-expanded', String(open));
-  });
-
-  els.statRgroups.addEventListener('click', function () {
-    var open = els.rgroupTablesPanel.classList.toggle('open');
-    els.statRgroups.setAttribute('aria-expanded', String(open));
+  // Delegated click handler for the summary line's Scaffolds/R-Groups links
+  // (rebuilt fresh via innerHTML on every search — see renderResultsSummary
+  // — so listeners go on the stable container, not the links themselves;
+  // same pattern as the results table's own Analysis-toggle delegation).
+  els.resultsSummary.addEventListener('click', function (e) {
+    var btn = e.target.closest('.summary-link');
+    if (!btn) return;
+    var panel = btn.dataset.toggle === 'scaffolds' ? els.scaffoldGroupsPanel : els.rgroupTablesPanel;
+    var open = panel.classList.toggle('open');
+    btn.setAttribute('aria-expanded', String(open));
   });
 
   // "N results span M distinct scaffolds" breakdown: one row per shared
@@ -784,6 +885,13 @@
   function renderScaffoldGroups(groups) {
     els.scaffoldGroupsPanel.innerHTML = '';
     if (groups.length === 0) return;
+
+    var note = document.createElement('p');
+    note.className = 'panel-note';
+    note.textContent = 'Results below that share the same core structure ' +
+      'are grouped together — useful for spotting families of related molecules.';
+    els.scaffoldGroupsPanel.appendChild(note);
+
     var maxCount = groups[0].count;
     groups.forEach(function (g) {
       var row = document.createElement('div');
@@ -799,7 +907,7 @@
 
       var smiles = document.createElement('span');
       smiles.className = 'scaffold-group-smiles';
-      var label = g.scaffold_smiles || '(acyclic, no ring scaffold)';
+      var label = g.scaffold_smiles || '(no ring — an open-chain structure)';
       smiles.textContent = label;
       smiles.title = label;
       row.appendChild(smiles);
@@ -820,13 +928,22 @@
   // with the rank/compound it corresponds to.
   function renderRgroupTables(tables, results) {
     els.rgroupTablesPanel.innerHTML = '';
+    if (tables.length === 0) return;
+
+    var note = document.createElement('p');
+    note.className = 'panel-note';
+    note.textContent = 'When results share a core structure, this shows ' +
+      'what’s different between them at each position — the classic ' +
+      '"what changed" comparison chemists call a structure-activity table.';
+    els.rgroupTablesPanel.appendChild(note);
+
     tables.forEach(function (t) {
       var wrap = document.createElement('div');
       wrap.className = 'rgroup-table-wrap';
 
       var label = document.createElement('div');
       label.className = 'rgroup-table-scaffold';
-      label.textContent = t.scaffold_smiles || '(acyclic, no ring scaffold)';
+      label.textContent = t.scaffold_smiles || '(no ring — an open-chain structure)';
       wrap.appendChild(label);
 
       var table = document.createElement('table');
@@ -939,7 +1056,7 @@
   // A labeled stat with a bar underneath, sized to `frac` (0..1) of the track
   // width — reuses the results table's own peak-track/peak-fill meter so the
   // panel doesn't introduce a second bar component.
-  function analysisStat(label, value, frac, opts) {
+  function analysisStat(label, hint, value, frac, opts) {
     opts = opts || {};
     var wrap = document.createElement('div');
     wrap.className = 'analysis-stat';
@@ -948,6 +1065,13 @@
     lbl.className = 'analysis-stat-label';
     lbl.textContent = label;
     wrap.appendChild(lbl);
+
+    if (hint) {
+      var hintEl = document.createElement('span');
+      hintEl.className = 'hint';
+      hintEl.textContent = hint;
+      wrap.appendChild(hintEl);
+    }
 
     var row = document.createElement('div');
     row.className = 'analysis-stat-row';
@@ -989,12 +1113,23 @@
     var total = r.shared_bits + r.query_unique_bits + r.candidate_unique_bits;
     var frac = function (n) { return total > 0 ? n / total : 0; };
 
+    // What a "fingerprint" and its "bits" even are — the four stats below
+    // are meaningless without this, so it's spelled out right where they
+    // first appear rather than assumed.
+    var fpNote = document.createElement('p');
+    fpNote.className = 'hint';
+    fpNote.style.marginBottom = '10px';
+    fpNote.textContent = 'Each molecule is reduced to about 1,024 yes/no ' +
+      'structural flags (a "fingerprint"). Two molecules are similar if ' +
+      'they share a lot of the same flags.';
+    panel.appendChild(fpNote);
+
     var stats = document.createElement('div');
     stats.className = 'analysis-stats';
-    stats.appendChild(analysisStat('Similarity score', r.score.toFixed(4), r.score, { shared: true }));
-    stats.appendChild(analysisStat('Shared bits', fmtInt(r.shared_bits), frac(r.shared_bits), { shared: true }));
-    stats.appendChild(analysisStat('Query-unique bits', fmtInt(r.query_unique_bits), frac(r.query_unique_bits), { muted: true }));
-    stats.appendChild(analysisStat('Candidate-unique bits', fmtInt(r.candidate_unique_bits), frac(r.candidate_unique_bits), { muted: true }));
+    stats.appendChild(analysisStat('Similarity score', '0 (no match) to 1 (identical structure)', r.score.toFixed(4), r.score, { shared: true }));
+    stats.appendChild(analysisStat('In common', 'structural features shared by both (fingerprint bits)', fmtInt(r.shared_bits), frac(r.shared_bits), { shared: true }));
+    stats.appendChild(analysisStat('Only in yours', 'in your molecule, not this one', fmtInt(r.query_unique_bits), frac(r.query_unique_bits), { muted: true }));
+    stats.appendChild(analysisStat('Only in this result', 'in this one, not yours', fmtInt(r.candidate_unique_bits), frac(r.candidate_unique_bits), { muted: true }));
     panel.appendChild(stats);
 
     // Bemis-Murcko scaffold: only present when the API resolved SMILES
@@ -1006,8 +1141,13 @@
 
       var scaffoldLabel = document.createElement('span');
       scaffoldLabel.className = 'analysis-stat-label';
-      scaffoldLabel.textContent = 'Scaffold';
+      scaffoldLabel.textContent = 'Core structure';
       scaffoldWrap.appendChild(scaffoldLabel);
+
+      var scaffoldHint = document.createElement('span');
+      scaffoldHint.className = 'hint';
+      scaffoldHint.textContent = 'What’s left after removing side groups — chemists call this the "scaffold".';
+      scaffoldWrap.appendChild(scaffoldHint);
 
       var scaffoldSmiles = document.createElement('span');
       scaffoldSmiles.className = 'analysis-scaffold-smiles';
@@ -1017,12 +1157,12 @@
 
         var scaffoldMeta = document.createElement('span');
         scaffoldMeta.className = 'analysis-scaffold-meta';
-        scaffoldMeta.textContent = r.ring_systems + ' ring system' + (r.ring_systems === 1 ? '' : 's') +
-          ' · ' + r.scaffold_atoms + ' scaffold atoms · ' + Math.round(r.framework_fraction * 100) + '% framework';
+        scaffoldMeta.textContent = r.ring_systems + ' separate ring cluster' + (r.ring_systems === 1 ? '' : 's') +
+          ' · ' + r.scaffold_atoms + ' atoms in the core · ' + Math.round(r.framework_fraction * 100) + '% of the molecule is this core';
         scaffoldWrap.appendChild(scaffoldSmiles);
         scaffoldWrap.appendChild(scaffoldMeta);
       } else {
-        scaffoldSmiles.textContent = 'none (acyclic — no ring scaffold)';
+        scaffoldSmiles.textContent = 'None — this molecule has no ring, so there’s no core to isolate.';
         scaffoldWrap.appendChild(scaffoldSmiles);
       }
       panel.appendChild(scaffoldWrap);
@@ -1037,8 +1177,14 @@
 
       var rgroupsLabel = document.createElement('span');
       rgroupsLabel.className = 'analysis-stat-label';
-      rgroupsLabel.textContent = 'R-Groups';
+      rgroupsLabel.textContent = 'Removed side groups';
       rgroupsWrap.appendChild(rgroupsLabel);
+
+      var rgroupsHint = document.createElement('span');
+      rgroupsHint.className = 'hint';
+      rgroupsHint.textContent = 'The pieces taken off to get the core above ' +
+        '(chemists call these "R-groups"), and which core atom each attaches to.';
+      rgroupsWrap.appendChild(rgroupsHint);
 
       var rgroupsList = document.createElement('div');
       rgroupsList.className = 'analysis-rgroup-list';
@@ -1081,19 +1227,39 @@
     table.id = 'results';
     table.className = 'fade-in';
 
+    // Each header pairs a plain-English word (what a first-time visitor
+    // reads) with the real technical term/unit as a small subtext line
+    // underneath (what a chemist expects to see) — same dual-labeling
+    // pattern used throughout the page. `num` right-aligns numeric columns.
     var thead = document.createElement('thead');
     var headRow = document.createElement('tr');
-    var headers = ['#', 'Score', 'Doc ID'];
+    var headers = [
+      { label: '#' },
+      { label: 'Match', hint: 'similarity, 0–1' },
+      { label: 'ID', hint: 'internal #, not chemical', num: true },
+    ];
     if (state.lanceAttached) {
-      headers = headers.concat(['Compound', 'SMILES', 'MW', 'LogP', 'Rot. bonds', 'Heavy atoms', 'Rings']);
+      headers = headers.concat([
+        { label: 'Compound', hint: 'catalog name' },
+        { label: 'Structure', hint: 'SMILES text' },
+        { label: 'Weight', hint: 'molecular weight', num: true },
+        { label: 'LogP', hint: 'fat-solubility', num: true },
+        { label: 'Flexibility', hint: 'rotatable bonds', num: true },
+        { label: 'Size', hint: 'atoms, no H', num: true },
+        { label: 'Rings', hint: 'ring count', num: true },
+      ]);
     }
-    headers.push('Similarity Analysis');
+    headers.push({ label: 'Details', hint: 'why it matched' });
     headers.forEach(function (h) {
       var th = document.createElement('th');
-      th.textContent = h;
-      if (h !== '#' && h !== 'Score' && h !== 'Compound' && h !== 'SMILES' && h !== 'Similarity Analysis') {
-        th.classList.add('num');
+      th.textContent = h.label;
+      if (h.hint) {
+        var hint = document.createElement('span');
+        hint.className = 'th-hint';
+        hint.textContent = h.hint;
+        th.appendChild(hint);
       }
+      if (h.num) th.classList.add('num');
       headRow.appendChild(th);
     });
     thead.appendChild(headRow);
@@ -1148,14 +1314,11 @@
     clearEmpty();
     els.resultsWrap.innerHTML = '';
     els.statsDashboard.classList.remove('show');
-    els.statCellScaffolds.style.display = 'none';
+    els.resultsSummary.innerHTML = '';
     els.scaffoldGroupsPanel.classList.remove('open');
     els.scaffoldGroupsPanel.innerHTML = '';
-    els.statScaffolds.setAttribute('aria-expanded', 'false');
-    els.statCellRgroups.style.display = 'none';
     els.rgroupTablesPanel.classList.remove('open');
     els.rgroupTablesPanel.innerHTML = '';
-    els.statRgroups.setAttribute('aria-expanded', 'false');
 
     els.searchBtn.disabled = true;
     els.searchBtn.textContent = 'Searching…';
@@ -1175,36 +1338,25 @@
         }
         var resp = res.data;
 
-        // Search Statistics dashboard — every field here comes from data the
-        // response already carries (docs_evaluated, results, search_time_ms)
-        // or from /health (fingerprint_type); nothing here re-queries the engine.
+        // Hero stat: how much of the billion-scale corpus WAND actually had
+        // to touch. Everything else lives in the small summary line below
+        // it — see renderResultsSummary.
         els.statSearched.textContent = fmtInt(resp.docs_evaluated);
-        els.statSearchedCaption.innerHTML = 'of ' +
+        els.statSearchedCaption.innerHTML = 'out of ' +
           (state.corpusSize != null ? fmtInt(state.corpusSize) : '?') +
-          ' indexed — <span class="frac">' + fmtPct(resp.eval_fraction_pct) + '</span> evaluated';
-        els.statMatches.textContent = fmtInt(resp.results.length);
-        els.statTime.textContent = fmtDuration(resp.search_time_ms);
-        var scores = scoreSummary(resp.results);
-        els.statAvg.textContent = scores ? scores.avg.toFixed(4) : '—';
-        els.statMax.textContent = scores ? scores.max.toFixed(4) : '—';
-        els.statFp.textContent = state.fingerprintType || '—';
+          ' in the library — only <span class="frac">' + fmtPct(resp.eval_fraction_pct) + '</span> had to be checked';
+        renderResultsSummary(resp);
         els.statsDashboard.classList.add('show');
 
-        // Scaffold grouping — only present when --lance is attached (see
-        // api.rs::handle_search); resp.scaffold_groups is [] otherwise.
+        // Scaffold grouping / R-group SAR tables — only present when
+        // --lance is attached (see api.rs::handle_search); both render into
+        // their (initially closed) panels regardless, since the summary
+        // line's links are the only way to open them and those are only
+        // shown by renderResultsSummary when there's something to show.
         if (resp.scaffold_groups && resp.scaffold_groups.length > 0) {
-          els.statScaffolds.textContent = fmtInt(resp.scaffold_groups.length);
-          els.statScaffoldsCaption.textContent = 'across ' + fmtInt(resp.results.length) + ' results';
-          els.statCellScaffolds.style.display = '';
           renderScaffoldGroups(resp.scaffold_groups);
         }
-
-        // R-group SAR tables — same gating as scaffold grouping above; empty
-        // whenever no scaffold in the result set is shared by 2+ results.
         if (resp.rgroup_tables && resp.rgroup_tables.length > 0) {
-          els.statRgroups.textContent = fmtInt(resp.rgroup_tables.length);
-          els.statRgroupsCaption.textContent = 'across ' + fmtInt(resp.results.length) + ' results';
-          els.statCellRgroups.style.display = '';
           renderRgroupTables(resp.rgroup_tables, resp.results);
         }
 
