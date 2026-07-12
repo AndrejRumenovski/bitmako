@@ -11,6 +11,10 @@
 > Query 1.36 billion molecules for near-neighbors in seconds, on a single
 > workstation, with results that are provably exact — not approximate.
 
+**Demo — a live search against the full 1.36B-compound corpus:**
+
+https://github.com/user-attachments/assets/86d9def0-7e69-4396-aad2-8ba4793e4efb
+
 ---
 
 ## Table of Contents
