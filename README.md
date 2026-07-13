@@ -114,13 +114,13 @@ collapsed property-filter panel:
 
 ![BitMako search UI](docs/screenshots/search-ui.png)
 
-**Search Statistics dashboard and results** — after a query, a compact
-dashboard summarizes it (molecules searched against the full corpus,
-matches, execution time, fingerprint type, average/maximum similarity, and,
-when `--lance` is attached, how many distinct Bemis-Murcko scaffolds and
-R-group SAR tables the result set spans), followed by the ranked results
-table with Tanimoto scores, an inline peak-bar per result, and resolved
-SMILES/property columns:
+**Search Statistics and results** — one hero stat (how many of the 1.36B
+compounds actually had to be checked), a small Google-style line underneath
+it with everything else (matches, time, similarity, fingerprint type, and,
+when `--lance` is attached, links into the Bemis-Murcko scaffold and R-group
+SAR breakdowns), followed by the ranked results table with Tanimoto scores,
+an inline peak-bar per result, and resolved SMILES/property columns — every
+label paired with a plain-English explanation underneath it:
 
 ![Search Statistics dashboard and results table](docs/screenshots/pruning-readout.png)
 
@@ -131,8 +131,8 @@ the R-groups stripped to reach it, without cluttering the default table view:
 
 ![Similarity Analysis panel expanded for one result](docs/screenshots/similarity-analysis.png)
 
-> Rendered from the shipped `static/index.html` with representative sample
-> data standing in for a live 1.36B-compound backend.
+> Captured live against the real, running 1.36B-compound backend — not
+> mocked or sample data.
 
 ## Features
 
@@ -157,11 +157,18 @@ the R-groups stripped to reach it, without cluttering the default table view:
   the actual fingerprint comparison — not canned text. Costs one extra mmap
   read per *returned* result, not per candidate evaluated, so it doesn't
   touch WAND's pruning loop or its performance.
-- **Search Statistics dashboard** — a compact strip above the results
-  showing molecules searched, match count, execution time, fingerprint type,
-  and average/maximum similarity for the query that just ran. Built almost
-  entirely from data the API was already returning; no charts, no history,
-  just the current query's own numbers.
+- **Search Statistics, Google-style** — one hero stat (how many of the 1.36B
+  compounds actually had to be checked) with everything else — match count,
+  execution time, similarity, fingerprint type — folded into one small, quiet
+  line underneath it, so a multi-second wall-clock number never competes for
+  attention with the actual pruning-ratio story. Built almost entirely from
+  data the API was already returning; no charts, no history, just the current
+  query's own numbers.
+- **Understandable with zero chemistry background** — every technical term
+  on the page (SMILES, Tanimoto score, MW/LogP, fingerprint bits, scaffold,
+  R-group) pairs a plain-English word with the real term as always-visible
+  subtext underneath it, from the search form to the per-result Analysis
+  panel — not hidden behind tooltips.
 - **Bemis-Murcko scaffold extraction & grouping** — every result's ring
   system + linkers, reduced from the molecular graph's 2-core with no
   separate ring-perception pass, canonicalized via iterative color
@@ -347,35 +354,36 @@ directly from the library.
 
 ## Search Statistics
 
-A compact dashboard sits above the results table in the web UI, giving a
-scan-at-a-glance summary of the query that just ran:
+One number gets the dramatic treatment; everything else is a small, quiet
+aside — deliberately, the way Google's results page treats its own result
+count vs. its "(0.45 seconds)" query time. A multi-second wall-clock number,
+dominated on this hardware by cold random-read latency rather than the
+algorithm, would undersell "billion-scale in seconds" if it were given equal
+visual weight to the actual pruning-ratio stat.
 
-| Field | Source |
-|---|---|
-| Molecules searched | `docs_evaluated` — already returned by `search_with_stats` (WAND's own pruning counter) |
-| Matches | `results.length` — the response's own result array |
-| Execution time | New: wall-clock time around the `search_with_stats` call, in `handle_search` |
-| Fingerprint type | New: a static constant (`FINGERPRINT_KIND` in `etl::fingerprint`), surfaced via `GET /health` |
-| Average similarity | Computed client-side from `results[].score` — already on every result |
-| Maximum similarity | Computed client-side from `results[].score` — already on every result |
+**The hero stat** — "Molecules Checked" — is `docs_evaluated`, already
+returned by `search_with_stats` (WAND's own pruning counter), with a caption
+computed from it and the corpus size (`eval_fraction_pct`): *"out of
+1,364,304,490 in the library — only 0.000006% had to be checked."*
 
-Four of the six fields are values the API was already returning for other
-reasons (the pruning-ratio hero readout and the results themselves); only
-**execution time** and **fingerprint type** required new fields, and both are
-cheap, single-value additions with no bearing on the search path itself —
-timing wraps the existing call from the outside, and the fingerprint type is
-a compile-time constant, not something computed per query.
+**Everything else lives in one small line underneath it**, joined by " · ":
+match count (`results.length`), execution time (wall-clock around the
+`search_with_stats` call, timed in `handle_search`), average/maximum
+similarity (computed client-side from `results[].score`, already on every
+result), fingerprint type (`FINGERPRINT_KIND` in `etl::fingerprint`, surfaced
+via `GET /health`), and — only when present — links into the scaffold/R-group
+breakdowns (see [Scaffold Analysis, Diversity Picking & R-Group
+Decomposition](#scaffold-analysis-diversity-picking--r-group-decomposition)).
+None of these needed new API fields beyond what execution time and
+fingerprint type already added; the summary line is pure client-side
+formatting (`renderResultsSummary` in `static/index.html`) over data the
+response already carries.
 
-**Where it lives:** the dashboard replaces what used to be a single
-standalone "N of 1.36B evaluated" hero readout — that fact is still here
-(now the dashboard's lead, amber-highlighted cell, "Molecules Searched"),
-just folded into one compact strip with the other five stats instead of
-occupying its own section. No second "stats area" was added above the
-results; the existing one grew from one fact to six. All of the layout and
-number-formatting logic lives in `static/index.html`'s existing `<script>`
-block, styled with the same label/value visual pattern already established
-for the [Similarity Analysis](#similarity-analysis) panel (uppercase mono
-labels, bold mono values) — no new colors, fonts, or components.
+**Where it lives:** `static/index.html`'s existing `<script>` block —
+`renderResultsSummary` builds the line fresh on every search; the hero cell
+keeps the same amber-highlighted treatment the original standalone "N of
+1.36B evaluated" readout used before either the dashboard or this redesign
+existed.
 
 **Why this doesn't affect search performance:** `search_time_ms` is measured
 with `std::time::Instant` wrapped *around* the existing `search_with_stats`
@@ -779,8 +787,9 @@ warm in the running server. Built on Axum over a multi-thread Tokio runtime.
 Serves the embedded single-page search UI (`static/index.html`, baked into
 the binary via `include_str!` — no separate build step or deploy artifact).
 Property-filter inputs auto-disable when `/health` reports no prop-store
-attached. A compact [Search Statistics](#search-statistics) dashboard sits
-above the results table for every query. Each result row also carries a
+attached. [Search Statistics](#search-statistics) — one hero stat plus a
+small summary line — sit above the results table for every query. Each
+result row also carries a
 collapsed "Analysis" toggle exposing its
 [Similarity Analysis](#similarity-analysis) panel — the bit-level breakdown
 and generated explanation — without cluttering the default table view.
